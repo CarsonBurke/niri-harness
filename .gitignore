@@ -1,0 +1,4 @@
+/build/
+/share/tessdata/
+__pycache__/
+*.pyc

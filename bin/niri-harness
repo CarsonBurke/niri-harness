@@ -1,0 +1,1506 @@
+#!/usr/bin/env python3
+"""Drive a native desktop application inside an isolated nested niri session.
+
+Why this exists
+---------------
+Verifying a GUI change on a Wayland desktop normally costs an agent a very
+large number of tokens: it screenshots, reads the image, guesses pixel
+coordinates, clicks, screenshots again to find out whether anything happened.
+Most of that spend is re-deriving facts the compositor already knows.
+
+This harness inverts that. `observe` returns the window geometry plus every
+on-screen text run with a stable reference, so an action is `click Open
+repository` rather than a pixel guess, and `act` reports whether the frame
+actually changed. An agent can drive a whole flow without reading a single
+image, and look at pixels only when appearance itself is the question.
+
+Isolation and self-healing are not optional extras here. Every session is a
+nested niri instance with its own Wayland socket, so the host session's focus,
+pointer and clipboard are never touched. Before every action the harness
+repairs the states that silently swallow input: an Overview opened by the
+pointer crossing a hot corner, an unmapped or not-yet-painted window, a window
+that is not the focused one, and a compositor output whose transform makes
+screenshot space disagree with pointer space.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+HARNESS_ROOT = Path(__file__).resolve().parent.parent
+BUILD_DIR = HARNESS_ROOT / "build"
+VPTR = BUILD_DIR / "vptr"
+NESTED_CONFIG = HARNESS_ROOT / "share" / "nested.kdl"
+TESSDATA = HARNESS_ROOT / "share" / "tessdata"
+
+STATE_DIR = Path(
+    os.environ.get("NIRI_HARNESS_STATE")
+    or (Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "niri-harness")
+)
+
+# A frame is considered painted once this fraction of sampled pixels differ
+# from the single most common value. A window that is mapped but has not yet
+# drawn is a uniform rectangle, and clicking into it is silently lost.
+PAINTED_MIN_VARIETY = 0.02
+
+# Two frames this close are treated as the same settled frame. Screenshots of
+# an idle window still differ by a few pixels: a blinking caret, a clock.
+STABLE_MAX_DIFF_FRACTION = 0.002
+
+
+class HarnessError(RuntimeError):
+    """A failure the caller can act on, reported without a traceback."""
+
+
+# --------------------------------------------------------------------------
+# process plumbing
+
+
+def run(
+    argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float = 30.0,
+    check: bool = True,
+    stdin: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    proc = subprocess.run(
+        argv,
+        env={**os.environ, **(env or {})},
+        input=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    if check and proc.returncode != 0:
+        raise HarnessError(
+            f"{argv[0]} failed ({proc.returncode}): "
+            f"{proc.stderr.decode(errors='replace').strip()[:400]}"
+        )
+    return proc
+
+
+def require_tool(name: str) -> str:
+    found = shutil.which(name)
+    if not found:
+        raise HarnessError(f"required tool {name!r} is not installed")
+    return found
+
+
+def ensure_built() -> None:
+    """Build the pointer injector and fetch the OCR model, once, on demand.
+
+    A fresh clone carries source and no artefacts, so the first command that
+    needs one runs `make` rather than telling the caller to.
+    """
+    wanted = (VPTR, TESSDATA / "eng.traineddata", TESSDATA / "configs" / "tsv")
+    missing = [path for path in wanted if not path.exists()]
+    if not missing:
+        return
+    run(["make", "-C", str(HARNESS_ROOT)], timeout=300)
+    still = [path for path in wanted if not path.exists()]
+    if still:
+        names = ", ".join(str(path.relative_to(HARNESS_ROOT)) for path in still)
+        raise HarnessError(f"`make` did not produce {names}; run it and read its output")
+
+
+def log_tail(log: Path, lines: int) -> str:
+    """The last few lines of an application log, for use inside an error."""
+    if not log.exists():
+        return "(no output)"
+    text = log.read_text(errors="replace").splitlines()
+    return "\n".join(text[-lines:]) or "(empty)"
+
+
+def await_application(session: Session, status: Path, deadline: float) -> None:
+    """Wait for the application to map a window, or to die trying.
+
+    Racing the two outcomes is what turns a 40-second timeout with a useless
+    message into an immediate, accurate one: the launcher records the command's
+    exit status, so a command that cannot start is known within a tick.
+    """
+    while True:
+        if status.exists():
+            code = status.read_text(errors="replace").strip() or "?"
+            raise HarnessError(
+                f"the application exited with status {code} without mapping a window."
+                f" Last output from {session.root / 'session.log'}:\n"
+                f"{log_tail(session.root / 'session.log', 15)}"
+            )
+        if windows(session):
+            return
+        if not session.alive():
+            raise HarnessError(
+                f"the nested compositor died while starting the application."
+                f" Last output from {session.root / 'session.log'}:\n"
+                f"{log_tail(session.root / 'session.log', 15)}"
+            )
+        if time.monotonic() > deadline:
+            raise HarnessError(
+                f"the application mapped no window before the timeout."
+                f" Last output from {session.root / 'session.log'}:\n"
+                f"{log_tail(session.root / 'session.log', 15)}"
+            )
+        time.sleep(0.15)
+
+
+
+def host_focused_window() -> int | None:
+    """The host's focused window, so a run can put focus back where it was."""
+    try:
+        payload = json.loads(run(["niri", "msg", "-j", "windows"], timeout=10).stdout)
+    except (HarnessError, json.JSONDecodeError):
+        return None
+    for window in payload or []:
+        if window.get("is_focused"):
+            return int(window["id"])
+    return None
+
+
+def restore_host_focus(window_id: int | None) -> str | None:
+    """Hand focus back to whatever the caller was using.
+
+    Starting a session unavoidably maps a window on the host, and the host
+    focuses new windows. Putting focus back is what makes a run something you
+    can start and then ignore, rather than something that interrupts you.
+    """
+    if window_id is None:
+        return None
+    if host_focused_window() == window_id:
+        return None
+    run(["niri", "msg", "action", "focus-window", "--id", str(window_id)],
+        check=False, timeout=10)
+    return f"focus returned to host window {window_id}"
+
+
+def fit_nested_viewport(session: Session, width: int) -> str:
+    """Give the application the logical width the caller asked for.
+
+    The nested compositor draws into a window the host lays out, so its
+    framebuffer shape is not ours to choose - and taking it by force, by
+    floating that window, is exactly the kind of desktop interference this
+    harness exists to avoid.
+
+    Width is the dimension a layout responds to: it decides whether a sidebar
+    collapses or a tab strip compacts. Setting the nested output's scale buys
+    that width without touching the host, because the application's logical
+    viewport is the framebuffer divided by the scale. Screenshots and pointer
+    coordinates stay in framebuffer pixels, so nothing about clicking changes.
+    """
+    try:
+        physical_w, physical_h, _ = output_geometry(session)
+    except HarnessError:
+        return "nested output reported no geometry; viewport left alone"
+    if physical_w <= 0 or width <= 0:
+        return "nested output has no width; viewport left alone"
+
+    names = list((session.niri_json("outputs") or {}).keys())
+    if not names:
+        return "nested session names no output; viewport left alone"
+
+    scale = round(max(0.5, min(4.0, physical_w / width)), 3)
+    session.niri("output", names[0], "scale", str(scale), check=False, timeout=10)
+    time.sleep(0.4)
+    try:
+        logical_w, logical_h, _ = output_geometry(session)
+    except HarnessError:
+        return f"scale {scale} applied; nested output stopped reporting geometry"
+    return (
+        f"viewport {logical_w}x{logical_h} logical "
+        f"(framebuffer {physical_w}x{physical_h}, scale {scale})"
+    )
+
+
+# --------------------------------------------------------------------------
+# sessions
+
+
+@dataclass
+class Session:
+    name: str
+    display: str
+    socket: str
+    pid: int
+    root: Path
+    # What sizing the nested output ended up with, for the start report only.
+    fit: str | None = None
+
+    @property
+    def env(self) -> dict[str, str]:
+        return {"WAYLAND_DISPLAY": self.display, "NIRI_SOCKET": self.socket}
+
+    @property
+    def shots(self) -> Path:
+        path = self.root / "shots"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def niri(self, *args: str, check: bool = True, timeout: float = 20.0):
+        return run(["niri", "msg", *args], env=self.env, check=check, timeout=timeout)
+
+    def niri_json(self, *args: str):
+        out = self.niri("-j", *args).stdout
+        return json.loads(out or b"null")
+
+    def alive(self) -> bool:
+        try:
+            os.kill(self.pid, 0)
+        except OSError:
+            return False
+        return Path(self.socket).exists()
+
+
+def session_file(name: str) -> Path:
+    return STATE_DIR / f"{name}.json"
+
+
+def save_session(session: Session) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    session_file(session.name).write_text(
+        json.dumps(
+            {
+                "name": session.name,
+                "display": session.display,
+                "socket": session.socket,
+                "pid": session.pid,
+                "root": str(session.root),
+            },
+            indent=2,
+        )
+    )
+
+
+def load_session(name: str | None) -> Session:
+    if name is None:
+        live = [s for s in list_sessions() if s.alive()]
+        if not live:
+            raise HarnessError("no live session; start one with `session start`")
+        if len(live) > 1:
+            names = ", ".join(s.name for s in live)
+            raise HarnessError(f"several live sessions ({names}); pass --session")
+        return live[0]
+    path = session_file(name)
+    if not path.exists():
+        raise HarnessError(f"unknown session {name!r}")
+    data = json.loads(path.read_text())
+    return Session(
+        name=data["name"],
+        display=data["display"],
+        socket=data["socket"],
+        pid=int(data["pid"]),
+        root=Path(data["root"]),
+    )
+
+
+def list_sessions() -> list[Session]:
+    if not STATE_DIR.exists():
+        return []
+    sessions = []
+    for path in sorted(STATE_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+            sessions.append(
+                Session(
+                    name=data["name"],
+                    display=data["display"],
+                    socket=data["socket"],
+                    pid=int(data["pid"]),
+                    root=Path(data["root"]),
+                )
+            )
+        except (OSError, ValueError, KeyError):
+            continue
+    return sessions
+
+
+# Which portal backends can actually draw a dialog inside a nested compositor.
+# The GNOME backend delegates its file chooser to Nautilus, which needs
+# Mutter's ServiceChannel and therefore fails outside a real GNOME session, so
+# a nested run that leaves backend selection to the desktop name gets a request
+# that never produces a window.
+PORTAL_BACKENDS = {
+    "gtk": "org.freedesktop.impl.portal.desktop.gtk",
+    "gnome": "org.freedesktop.impl.portal.desktop.gnome",
+    "kde": "org.freedesktop.impl.portal.desktop.kde",
+    "cosmic": "org.freedesktop.impl.portal.desktop.cosmic",
+}
+
+
+def configure_portal(
+    backend: str, root: Path, env_overrides: dict[str, str], command: str
+) -> str:
+    """Give the session its own portal, drawing inside the nested compositor.
+
+    A file chooser reached through xdg-desktop-portal is drawn by a backend
+    process, not by the application. On the host's session bus that backend is
+    already running and connected to the host compositor, so the dialog appears
+    on the host desktop, outside the isolation the session exists to provide.
+    Running the application on its own bus makes the backend activate fresh and
+    inherit the nested display, so the dialog is part of the session under test.
+    """
+    if backend not in PORTAL_BACKENDS:
+        known = ", ".join(sorted(PORTAL_BACKENDS))
+        raise HarnessError(f"unknown portal backend {backend!r}; known: {known}")
+    require_tool("dbus-run-session")
+
+    config_home = Path(
+        env_overrides.get("XDG_CONFIG_HOME") or (root / "xdg-config")
+    )
+    env_overrides.setdefault("XDG_CONFIG_HOME", str(config_home))
+    portal_config = config_home / "xdg-desktop-portal"
+    portal_config.mkdir(parents=True, exist_ok=True)
+    # Both gtk.portal and gnome.portal declare `UseIn=gnome`, so the desktop
+    # name alone cannot select between them; only an explicit preference can.
+    (portal_config / "portals.conf").write_text(
+        "[preferred]\n"
+        f"default={backend}\n"
+        f"org.freedesktop.impl.portal.FileChooser={backend}\n"
+    )
+    # A backend still consults the desktop name to decide it is wanted at all.
+    env_overrides.setdefault("XDG_CURRENT_DESKTOP", "gnome")
+    return f"exec dbus-run-session -- /bin/sh -c {shell_quote(command)}"
+
+
+def start_session(
+    name: str,
+    command: str,
+    *,
+    root: Path,
+    portal: str | None,
+    env_overrides: dict[str, str],
+    timeout: float,
+    expect_window: bool = True,
+    width: int | None = 1600,
+) -> Session:
+    ensure_built()
+    require_tool("niri")
+    existing = session_file(name)
+    if existing.exists():
+        previous = load_session(name)
+        if previous.alive():
+            raise HarnessError(
+                f"session {name!r} is already live (pid {previous.pid}); stop it first"
+            )
+        existing.unlink()
+
+    root.mkdir(parents=True, exist_ok=True)
+    handshake = root / "session.env"
+    handshake.unlink(missing_ok=True)
+    status = root / "session.rc"
+    status.unlink(missing_ok=True)
+    log = root / "session.log"
+
+    if portal:
+        command = configure_portal(portal, root, env_overrides, command)
+
+
+    # The child records the nested environment it inherited. Discovering it any
+    # other way means scanning for sockets, which races other nested sessions.
+    launcher = root / "launch.sh"
+    exports = "\n".join(
+        f"export {key}={shell_quote(value)}" for key, value in sorted(env_overrides.items())
+    )
+    launcher.write_text(
+        "#!/bin/sh\n"
+        "# Written by niri-harness. Runs inside the nested compositor.\n"
+        f"printf 'WAYLAND_DISPLAY=%s\\nNIRI_SOCKET=%s\\n' "
+        f'"$WAYLAND_DISPLAY" "$NIRI_SOCKET" > {shell_quote(str(handshake))}\n'
+        f"{exports}\n"
+        # This shell deliberately does NOT exec the command: it stays behind to
+        # record the exit status, which is the only way to tell "the
+        # application has not appeared yet" from "the application is already
+        # dead". Nothing leaks, because the whole session is one process group
+        # and stopping it terminates the group.
+        f"/bin/sh -c {shell_quote(command)} >> {shell_quote(str(log))} 2>&1\n"
+        f'printf %s "$?" > {shell_quote(str(status))}\n'
+    )
+    launcher.chmod(0o755)
+
+    # The session gets its own copy of the configuration so a run is
+    # reproducible from its own directory even if the shared template changes.
+    session_config = root / "nested.kdl"
+    session_config.write_text(NESTED_CONFIG.read_text())
+    run(["niri", "validate", "-c", str(session_config)], timeout=20)
+
+    # Recorded before the window exists, so it names the caller's own window.
+    previous_focus = host_focused_window()
+
+    proc = subprocess.Popen(
+        ["niri", "-c", str(session_config), "--", str(launcher)],
+        env=dict(os.environ),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if handshake.exists():
+            text = handshake.read_text()
+            display = re.search(r"WAYLAND_DISPLAY=(\S+)", text)
+            socket = re.search(r"NIRI_SOCKET=(\S+)", text)
+            if display and socket:
+                session = Session(
+                    name=name,
+                    display=display.group(1),
+                    socket=socket.group(1),
+                    pid=proc.pid,
+                    root=root,
+                )
+                save_session(session)
+                # The handshake proves the compositor is up, not the
+                # application: the launcher writes it first, so a command that
+                # does not exist still gets this far. A session whose
+                # application never appeared is a failed start, and it must not
+                # stay registered as live - `Session.alive()` watches the
+                # compositor, which outlives its dead client quite happily.
+                if expect_window:
+                    try:
+                        await_application(session, status, deadline)
+                    except HarnessError as error:
+                        stop_session(session)
+                        raise HarnessError(str(error)) from None
+                    if width is not None:
+                        session.fit = fit_nested_viewport(session, width)
+                    # The host focuses a newly mapped window, and this one is
+                    # the harness's, not the caller's. Give it back.
+                    returned = restore_host_focus(previous_focus)
+                    if returned:
+                        session.fit = f"{session.fit + '; ' if session.fit else ''}{returned}"
+                return session
+        if proc.poll() is not None:
+            raise HarnessError(
+                f"nested niri exited with {proc.returncode} before handshake; see {log}"
+            )
+        time.sleep(0.1)
+    proc.terminate()
+    raise HarnessError(f"nested niri did not hand back its environment within {timeout:g}s")
+
+
+def shell_quote(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_@%+=:,./-]+", value or ""):
+        return value
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def stop_session(session: Session, *, timeout: float = 10.0) -> str:
+    if not session.alive():
+        session_file(session.name).unlink(missing_ok=True)
+        return "already stopped"
+    session.niri("action", "quit", "--skip-confirmation", check=False, timeout=5)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not session.alive():
+            session_file(session.name).unlink(missing_ok=True)
+            return "stopped"
+        time.sleep(0.1)
+    # The compositor owns every client in the session, so terminating its
+    # process group is the bounded fallback rather than hunting for children.
+    try:
+        os.killpg(os.getpgid(session.pid), signal.SIGTERM)
+    except OSError:
+        pass
+    time.sleep(0.5)
+    if session.alive():
+        try:
+            os.killpg(os.getpgid(session.pid), signal.SIGKILL)
+        except OSError:
+            pass
+    session_file(session.name).unlink(missing_ok=True)
+    return "killed"
+
+
+# --------------------------------------------------------------------------
+# windows and healing
+
+
+def windows(session: Session) -> list[dict]:
+    return session.niri_json("windows") or []
+
+
+def outputs(session: Session) -> list[dict]:
+    data = session.niri_json("outputs") or {}
+    if isinstance(data, dict):
+        return [{"name": name, **value} for name, value in data.items()]
+    return data
+
+
+def pick_window(session: Session, match: str | None) -> dict:
+    found = windows(session)
+    if not found:
+        raise HarnessError("nested session has no windows")
+    if match is None:
+        focused = [w for w in found if w.get("is_focused")]
+        return focused[0] if focused else found[0]
+    lowered = match.lower()
+    for window in found:
+        haystack = f"{window.get('app_id') or ''} {window.get('title') or ''}".lower()
+        if lowered in haystack:
+            return window
+    known = ", ".join(f"{w.get('app_id')}:{w.get('title')}" for w in found)
+    raise HarnessError(f"no window matching {match!r}; have {known}")
+
+
+def output_geometry(session: Session) -> tuple[int, int, str]:
+    for output in outputs(session):
+        logical = output.get("logical") or {}
+        if logical:
+            return (
+                int(logical.get("width") or 0),
+                int(logical.get("height") or 0),
+                str(logical.get("transform") or "Normal"),
+            )
+    raise HarnessError("nested session reports no output geometry")
+
+
+def screenshot(session: Session, name: str) -> Path:
+    require_tool("grim")
+    path = session.shots / name
+    run(["grim", str(path)], env=session.env, timeout=25)
+    return path
+
+
+def load_image(path: Path):
+    from PIL import Image
+
+    return Image.open(path).convert("RGB")
+
+
+def frame_stats(path: Path) -> tuple[float, tuple[int, int]]:
+    """Fraction of sampled pixels that differ from the most common value."""
+    import numpy as np
+
+    image = load_image(path)
+    array = np.asarray(image)
+    step = max(1, min(array.shape[0], array.shape[1]) // 200)
+    sample = array[::step, ::step].reshape(-1, 3)
+    packed = (
+        sample[:, 0].astype(np.uint32) << 16
+        | sample[:, 1].astype(np.uint32) << 8
+        | sample[:, 2].astype(np.uint32)
+    )
+    if packed.size == 0:
+        return 0.0, image.size
+    _, counts = np.unique(packed, return_counts=True)
+    return 1.0 - counts.max() / packed.size, image.size
+
+
+def frame_difference(first: Path, second: Path) -> float:
+    import numpy as np
+
+    a = np.asarray(load_image(first), dtype=np.int16)
+    b = np.asarray(load_image(second), dtype=np.int16)
+    if a.shape != b.shape:
+        return 1.0
+    step = max(1, min(a.shape[0], a.shape[1]) // 300)
+    da = a[::step, ::step]
+    db = b[::step, ::step]
+    changed = (np.abs(da - db).max(axis=2) > 12).mean()
+    return float(changed)
+
+
+def overview_open(session: Session) -> bool:
+    data = session.niri_json("overview-state")
+    if isinstance(data, dict):
+        for key in ("is_open", "open", "overview_open"):
+            if key in data:
+                return bool(data[key])
+    return False
+
+
+def heal(session: Session, *, window_match: str | None = None) -> list[str]:
+    """Repair the states that silently swallow input. Returns what it did."""
+    actions: list[str] = []
+    if not session.alive():
+        raise HarnessError(f"session {session.name!r} is not alive")
+
+    if overview_open(session):
+        # Reached by the pointer crossing a hot corner. The config disables
+        # them, but a session started before that config, or a deliberate
+        # gesture, still lands here.
+        keyboard_key(session, "Escape")
+        time.sleep(0.2)
+        if overview_open(session):
+            session.niri("action", "close-overview", check=False)
+            time.sleep(0.2)
+        actions.append("closed overview")
+
+    width, height, transform = output_geometry(session)
+    if transform != "Normal":
+        # Left alone this makes screenshot space and pointer space disagree,
+        # so every located coordinate is wrong by a reflection.
+        for output in outputs(session):
+            session.niri(
+                "output", str(output.get("name")), "transform", "normal", check=False
+            )
+        _, _, now = output_geometry(session)
+        actions.append(
+            f"transform {transform} -> {now}"
+            if now == "Normal"
+            else f"transform {transform} not correctable (still {now})"
+        )
+
+    found = windows(session)
+    if not found:
+        raise HarnessError("nested session has no windows to act on")
+    window = pick_window(session, window_match)
+    window_id = str(window.get("id"))
+
+    if not window.get("is_focused"):
+        session.niri("action", "focus-window", "--id", window_id, check=False)
+        time.sleep(0.15)
+        actions.append(f"focused window {window_id}")
+
+    size = (window.get("layout") or {}).get("window_size") or [0, 0]
+    if size[0] < width * 0.9:
+        # A half-width column makes every coordinate in a caller's notes wrong
+        # the moment another window appears, so the target under test always
+        # occupies the whole output.
+        session.niri("action", "maximize-column", check=False)
+        time.sleep(0.2)
+        actions.append("maximized column")
+
+    return actions
+
+
+def wait_window(
+    session: Session, *, match: str | None = None, timeout: float = 30.0
+) -> dict:
+    """Wait for the application to map a window.
+
+    A freshly started GPU application takes a moment to appear, and healing or
+    clicking before it does reports a confusing "no windows" failure instead of
+    simply waiting.
+    """
+    deadline = time.monotonic() + timeout
+    last_error = "no windows appeared"
+    while time.monotonic() < deadline:
+        if not session.alive():
+            raise HarnessError(
+                f"session {session.name!r} died while waiting for a window; "
+                f"see {session.root / 'session.log'}"
+            )
+        try:
+            return pick_window(session, match)
+        except HarnessError as error:
+            last_error = str(error)
+        time.sleep(0.25)
+    raise HarnessError(f"{last_error} within {timeout:g}s")
+
+
+def wait_painted(session: Session, *, timeout: float = 20.0) -> Path:
+    """Wait until the output has actually drawn something."""
+    deadline = time.monotonic() + timeout
+    last: Path | None = None
+    while time.monotonic() < deadline:
+        last = screenshot(session, "_painted.png")
+        variety, _ = frame_stats(last)
+        if variety >= PAINTED_MIN_VARIETY:
+            return last
+        time.sleep(0.3)
+    raise HarnessError(
+        f"output never painted within {timeout:g}s (still a near-uniform frame); "
+        f"see {session.root / 'session.log'}"
+    )
+
+
+def wait_stable(session: Session, *, timeout: float = 10.0, settle: float = 0.35) -> Path:
+    deadline = time.monotonic() + timeout
+    previous = screenshot(session, "_stable_a.png")
+    while time.monotonic() < deadline:
+        time.sleep(settle)
+        current = screenshot(session, "_stable_b.png")
+        if frame_difference(previous, current) <= STABLE_MAX_DIFF_FRACTION:
+            return current
+        previous = current.rename(session.shots / "_stable_a.png")
+    return previous
+
+
+# --------------------------------------------------------------------------
+# text observation
+
+
+@dataclass
+class TextRun:
+    ref: str
+    text: str
+    x: int
+    y: int
+    width: int
+    height: int
+    confidence: float
+
+    @property
+    def center(self) -> tuple[int, int]:
+        return self.x + self.width // 2, self.y + self.height // 2
+
+
+# Desktop UI type is small and light-on-dark. Tesseract expects dark text on a
+# light page at document resolution, so every frame is inverted, contrast
+# stretched, and upscaled before it is read.
+OCR_SCALE = 4
+
+# Whole-frame layout analysis is the wrong tool here: given a window that mixes
+# a sidebar, a toolbar and a terminal, tesseract locks onto the largest text
+# block and discards the rest, so a full-frame pass finds the terminal clock
+# and nothing else. Reading overlapping tiles instead gives each region its own
+# layout analysis. The overlap must exceed one line height so a label centred
+# on a seam is still wholly inside some tile.
+OCR_TILE = 420
+OCR_OVERLAP = 90
+
+
+def _read_tile_once(scaled_path: str, min_confidence: float) -> list[dict]:
+    """Run tesseract over one prepared tile and return raw word boxes."""
+    try:
+        proc = subprocess.run(
+            ["tesseract", scaled_path, "stdout", "--psm", "3", "-l", "eng", "tsv"],
+            env={**os.environ, "TESSDATA_PREFIX": str(TESSDATA)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return []
+
+    found: list[dict] = []
+    for line in proc.stdout.decode(errors="replace").splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) < 12:
+            continue
+        try:
+            left, top = int(parts[6]), int(parts[7])
+            width, height = int(parts[8]), int(parts[9])
+            confidence = float(parts[10])
+        except ValueError:
+            continue
+        text = parts[11].strip()
+        if not text or confidence < min_confidence:
+            continue
+        found.append(
+            {
+                "text": text,
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height,
+                "confidence": confidence,
+            }
+        )
+    return found
+
+
+
+
+def _ocr_tile(job: tuple[str, int, int, float]) -> list[dict]:
+    """Read one tile at whichever polarity tesseract can actually read.
+
+    Runs in a worker process, so it takes and returns plain data.
+
+    Polarity has to be decided per tile rather than per frame. A desktop
+    application is not uniformly themed: this project's own window is
+    light-on-dark while the file chooser it opens is dark-on-light, and one
+    window can hold both. Inverting the whole frame unconditionally made the
+    light dialog unreadable - it returned five words instead of the ~190 that
+    are on screen. Mean luminance picks the likely polarity cheaply, and a tile
+    that yields nothing is retried the other way round, so a wrong guess costs
+    one extra pass instead of the contents of the screen.
+    """
+    from PIL import Image, ImageOps
+
+    path, offset_x, offset_y, min_confidence = job
+    tile = Image.open(path).convert("L")
+    scaled = tile.resize((tile.width * OCR_SCALE, tile.height * OCR_SCALE), Image.LANCZOS)
+
+    histogram = scaled.histogram()
+    total = sum(histogram) or 1
+    mean = sum(value * count for value, count in enumerate(histogram)) / total
+    # Dark tile first: light text on dark ground needs inverting for tesseract,
+    # which expects ink on paper.
+    polarities = [True, False] if mean < 128 else [False, True]
+
+    raw: list[dict] = []
+    scaled_path = ""
+    try:
+        for invert in polarities:
+            prepared = ImageOps.autocontrast(
+                ImageOps.invert(scaled) if invert else scaled
+            )
+            scaled_path = f"{path}.{'inv' if invert else 'dir'}.png"
+            prepared.save(scaled_path)
+            raw = _read_tile_once(scaled_path, min_confidence)
+            try:
+                os.unlink(scaled_path)
+            except OSError:
+                pass
+            if raw:
+                break
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    return [
+        {
+            "text": entry["text"],
+            "x": offset_x + entry["left"] // OCR_SCALE,
+            "y": offset_y + entry["top"] // OCR_SCALE,
+            "width": max(1, entry["width"] // OCR_SCALE),
+            "height": max(1, entry["height"] // OCR_SCALE),
+            "confidence": entry["confidence"],
+        }
+        for entry in raw
+    ]
+
+
+def ocr_runs(path: Path, *, min_confidence: float = 45.0) -> list[TextRun]:
+    require_tool("tesseract")
+    ensure_built()
+    import tempfile
+    from concurrent.futures import ProcessPoolExecutor
+
+    from PIL import Image
+
+    # Tiles are cut from the untouched frame; each worker decides its own
+    # polarity and contrast, because those are properties of a region.
+    prepared = Image.open(path).convert("L")
+    step = OCR_TILE - OCR_OVERLAP
+    jobs: list[tuple[str, int, int, float]] = []
+    scratch = tempfile.mkdtemp(prefix="niri-harness-ocr-")
+    for top in range(0, max(1, prepared.height - OCR_OVERLAP), step):
+        for left in range(0, max(1, prepared.width - OCR_OVERLAP), step):
+            box = (
+                left,
+                top,
+                min(left + OCR_TILE, prepared.width),
+                min(top + OCR_TILE, prepared.height),
+            )
+            tile_path = os.path.join(scratch, f"{left}_{top}.png")
+            prepared.crop(box).save(tile_path)
+            jobs.append((tile_path, left, top, min_confidence))
+
+    collected: list[dict] = []
+    try:
+        with ProcessPoolExecutor(max_workers=min(12, (os.cpu_count() or 4))) as pool:
+            for batch in pool.map(_ocr_tile, jobs):
+                collected.extend(batch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    runs = [
+        TextRun(
+            ref="",
+            text=entry["text"],
+            x=entry["x"],
+            y=entry["y"],
+            width=entry["width"],
+            height=entry["height"],
+            confidence=entry["confidence"],
+        )
+        for entry in collected
+    ]
+    return merge_runs(deduplicate_runs(runs))
+
+
+def deduplicate_runs(runs: list[TextRun]) -> list[TextRun]:
+    """Drop the same word found twice because tiles overlap.
+
+    Two detections are the same word when the text matches and the boxes
+    substantially coincide. Keeping the more confident one biases towards the
+    tile that saw the whole glyph rather than a clipped edge.
+    """
+    kept: list[TextRun] = []
+    for candidate in sorted(runs, key=lambda r: -r.confidence):
+        duplicate = False
+        for existing in kept:
+            if existing.text != candidate.text:
+                continue
+            overlap_x = min(existing.x + existing.width, candidate.x + candidate.width) - max(
+                existing.x, candidate.x
+            )
+            overlap_y = min(existing.y + existing.height, candidate.y + candidate.height) - max(
+                existing.y, candidate.y
+            )
+            if overlap_x <= 0 or overlap_y <= 0:
+                continue
+            smaller = min(existing.width * existing.height, candidate.width * candidate.height)
+            if smaller and (overlap_x * overlap_y) / smaller > 0.5:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(candidate)
+    return kept
+
+
+def merge_runs(runs: list[TextRun]) -> list[TextRun]:
+    """Join words that sit on one baseline into a single clickable label.
+
+    Tesseract in sparse mode returns words. A caller wants to click
+    "Open repository", not "Open" then "repository", and a label's own centre is
+    a far better click target than the centre of its first word.
+    """
+    ordered = sorted(runs, key=lambda r: (r.y // 8, r.x))
+    merged: list[TextRun] = []
+    for run_ in ordered:
+        if merged:
+            last = merged[-1]
+            same_line = abs((last.y + last.height // 2) - (run_.y + run_.height // 2)) <= max(
+                6, last.height // 2
+            )
+            gap = run_.x - (last.x + last.width)
+            if same_line and 0 <= gap <= max(14, last.height):
+                right = max(last.x + last.width, run_.x + run_.width)
+                bottom = max(last.y + last.height, run_.y + run_.height)
+                last.text = f"{last.text} {run_.text}"
+                last.x = min(last.x, run_.x)
+                last.y = min(last.y, run_.y)
+                last.width = right - last.x
+                last.height = bottom - last.y
+                last.confidence = min(last.confidence, run_.confidence)
+                continue
+        merged.append(run_)
+    for index, run_ in enumerate(merged, start=1):
+        run_.ref = f"t{index}"
+    return merged
+
+
+def observe(
+    session: Session,
+    *,
+    window_match: str | None,
+    do_heal: bool,
+    with_text: bool,
+) -> dict:
+    healed = heal(session, window_match=window_match) if do_heal else []
+    # An application that has drawn nothing yet is worth waiting for, but a
+    # window that is legitimately near-uniform - a dark terminal holding one
+    # line - is not a failure to observe. Report the fact and carry on; the
+    # empty text list says the same thing in a way the caller can act on.
+    painted = True
+    try:
+        wait_painted(session)
+    except HarnessError:
+        painted = False
+    frame = wait_stable(session)
+    width, height, transform = output_geometry(session)
+    window = pick_window(session, window_match)
+    runs = ocr_runs(frame) if with_text else []
+    cache = session.root / "observed.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "frame": str(frame),
+                "runs": [run_.__dict__ for run_ in runs],
+            },
+            indent=2,
+        )
+    )
+    return {
+        "session": session.name,
+        "display": session.display,
+        "output": {"width": width, "height": height, "transform": transform},
+        "window": {
+            "id": window.get("id"),
+            "app_id": window.get("app_id"),
+            "title": window.get("title"),
+            "size": (window.get("layout") or {}).get("window_size"),
+            "focused": bool(window.get("is_focused")),
+        },
+        "healed": healed,
+        "painted": painted,
+        "frame": str(frame),
+        "runs": runs,
+    }
+
+
+def load_observed(session: Session) -> list[TextRun]:
+    cache = session.root / "observed.json"
+    if not cache.exists():
+        raise HarnessError("nothing observed yet; run `observe` first")
+    data = json.loads(cache.read_text())
+    return [TextRun(**entry) for entry in data["runs"]]
+
+
+def resolve_target(session: Session, target: str, *, fresh: bool) -> tuple[int, int, str]:
+    """Turn a ref, a label or an explicit coordinate into a click point."""
+    coordinate = re.fullmatch(r"\s*(\d+)\s*,\s*(\d+)\s*", target)
+    if coordinate:
+        return int(coordinate.group(1)), int(coordinate.group(2)), f"point {target}"
+
+    runs = ocr_runs(wait_stable(session)) if fresh else load_observed(session)
+    if re.fullmatch(r"t\d+", target):
+        for run_ in runs:
+            if run_.ref == target:
+                x, y = run_.center
+                return x, y, f"{run_.ref} {run_.text!r}"
+        raise HarnessError(f"no such reference {target!r}; re-run `observe`")
+
+    lowered = target.lower()
+    exact = [r for r in runs if r.text.lower() == lowered]
+    partial = [r for r in runs if lowered in r.text.lower()]
+    candidates = exact or partial
+    if not candidates:
+        visible = ", ".join(repr(r.text) for r in runs[:40])
+        raise HarnessError(f"no visible text matching {target!r}; visible: {visible}")
+    if len(candidates) > 1 and not exact:
+        where = ", ".join(f"{r.ref}@{r.x},{r.y} {r.text!r}" for r in candidates[:8])
+        raise HarnessError(f"{target!r} is ambiguous: {where}; click a reference instead")
+    chosen = candidates[0]
+    x, y = chosen.center
+    # Repeated labels are ordinary in a real UI, so the first in reading order
+    # is a defensible choice - but never a silent one, because a click landing
+    # on the wrong copy is the hardest kind of failure to spot afterwards.
+    if len(candidates) > 1:
+        others = ", ".join(f"{r.ref}@{r.x},{r.y}" for r in candidates[1:6])
+        return x, y, f"{chosen.ref} {chosen.text!r} (first of {len(candidates)}; others {others})"
+    return x, y, f"{chosen.ref} {chosen.text!r}"
+
+
+# --------------------------------------------------------------------------
+# input
+
+
+def pointer(session: Session, *args: str) -> None:
+    ensure_built()
+    run([str(VPTR), *args], env=session.env, timeout=30)
+
+
+def click(session: Session, x: int, y: int, *, button: str = "left", double: bool = False) -> None:
+    commands = ["a", str(x), str(y), ";", "w", "120", ";", "c", button]
+    if double:
+        commands += [";", "w", "60", ";", "c", button]
+    pointer(session, *commands)
+
+
+def keyboard_text(session: Session, text: str) -> None:
+    require_tool("wtype")
+    run(["wtype", "--", text], env=session.env, timeout=30)
+
+
+def keyboard_key(session: Session, chord: str) -> None:
+    """Press one chord such as `ctrl+s`, `ctrl+shift+w`, `Escape`, `F12`."""
+    require_tool("wtype")
+    parts = [part for part in chord.split("+") if part]
+    if not parts:
+        raise HarnessError("empty key chord")
+    modifiers, key = parts[:-1], parts[-1]
+    argv: list[str] = []
+    for modifier in modifiers:
+        argv += ["-M", modifier.lower()]
+    argv += ["-k", key]
+    for modifier in reversed(modifiers):
+        argv += ["-m", modifier.lower()]
+    run(["wtype", *argv], env=session.env, timeout=30)
+
+
+def scroll(session: Session, axis: str, notches: float) -> None:
+    pointer(session, "s", "v" if axis.startswith("v") else "h", str(notches))
+
+
+# --------------------------------------------------------------------------
+# acting with proof
+
+
+def act(
+    session: Session,
+    description: str,
+    perform,
+    *,
+    shot_name: str | None,
+    settle: float,
+) -> dict:
+    before = screenshot(session, "_act_before.png")
+    perform()
+    time.sleep(settle)
+    after = wait_stable(session)
+    changed = frame_difference(before, after)
+    kept = None
+    if shot_name:
+        kept = session.shots / shot_name
+        shutil.copyfile(after, kept)
+    return {
+        "action": description,
+        "frame_changed_fraction": round(changed, 5),
+        "changed": changed > STABLE_MAX_DIFF_FRACTION,
+        "shot": str(kept) if kept else None,
+    }
+
+
+# --------------------------------------------------------------------------
+# rendering
+
+
+def render(payload: dict, *, as_json: bool) -> str:
+    if as_json:
+        return json.dumps(payload, default=lambda o: o.__dict__, indent=2)
+    lines: list[str] = []
+    if "session" in payload and "window" in payload:
+        output = payload["output"]
+        window = payload["window"]
+        lines.append(
+            f"session={payload['session']} display={payload['display']} "
+            f"output={output['width']}x{output['height']} transform={output['transform']}"
+        )
+        lines.append(
+            f"window={window['id']} {window['app_id']} "
+            f"size={window['size']} focused={window['focused']} title={window['title']!r}"
+        )
+        if payload.get("painted") is False:
+            lines.append(
+                "painted=False (output is near-uniform; the window may still be blank)"
+            )
+        if payload.get("fit"):
+            lines.append(f"fit: {payload['fit']}")
+        if payload.get("healed"):
+            lines.append("healed: " + "; ".join(payload["healed"]))
+        lines.append(f"frame={payload['frame']}")
+        runs = payload.get("runs") or []
+        if runs:
+            lines.append(f"text runs ({len(runs)}):")
+            for run_ in runs:
+                data = run_ if isinstance(run_, dict) else run_.__dict__
+                lines.append(
+                    f"  [{data['ref']}] {data['x']:>5},{data['y']:>5} "
+                    f"{data['width']:>4}x{data['height']:<3} {data['text']}"
+                )
+        return "\n".join(lines)
+    for key, value in payload.items():
+        lines.append(f"{key}={value}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# command line
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="niri-harness",
+        description="Drive a desktop app in an isolated nested niri session.",
+    )
+    parser.add_argument("--session", help="session name (default: the only live one)")
+    parser.add_argument("--window", help="substring matching app_id or title")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument(
+        "--no-heal", action="store_true", help="skip the pre-action repair pass"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    session = sub.add_parser("session", help="manage nested sessions")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    start = session_sub.add_parser("start", help="start a nested session running a command")
+    start.add_argument("name")
+    start.add_argument("--root", required=True, help="directory for logs, shots and state")
+    start.add_argument(
+        "--portal",
+        choices=sorted(PORTAL_BACKENDS),
+        help="run on a private bus so portal dialogs appear inside the session",
+    )
+    start.add_argument("--env", action="append", default=[], metavar="K=V")
+    start.add_argument("--timeout", type=float, default=40.0)
+    start.add_argument(
+        "--no-window-wait",
+        action="store_true",
+        help="return as soon as the compositor is up, for a command with no window",
+    )
+    start.add_argument(
+        "--cmd",
+        required=True,
+        help="shell command to run inside the session, e.g. 'cd /repo && exec ./app'",
+    )
+    start.add_argument(
+        "--width",
+        default="1600",
+        metavar="PX",
+        help=(
+            "logical width the application lays out against, set with the nested"
+            " output's scale; 'host' accepts the host's own sizing"
+        ),
+    )
+    session_sub.add_parser("list", help="list known sessions")
+    stop = session_sub.add_parser("stop", help="stop a session")
+    stop.add_argument("name", nargs="?")
+    env_cmd = session_sub.add_parser("env", help="print a session's nested environment")
+    env_cmd.add_argument("name", nargs="?")
+
+    observe_cmd = sub.add_parser("observe", help="window geometry plus located text")
+    observe_cmd.add_argument("--no-text", action="store_true", help="skip OCR")
+
+    heal_cmd = sub.add_parser("heal", help="repair input-swallowing states")
+
+    click_cmd = sub.add_parser("click", help="click a ref, a visible label, or X,Y")
+    click_cmd.add_argument("target")
+    click_cmd.add_argument("--button", default="left", choices=["left", "right", "middle"])
+    click_cmd.add_argument("--double", action="store_true")
+    click_cmd.add_argument("--shot")
+    click_cmd.add_argument("--settle", type=float, default=0.4)
+    click_cmd.add_argument(
+        "--stale-ok",
+        action="store_true",
+        help="resolve against the last observation instead of a fresh one",
+    )
+
+    type_cmd = sub.add_parser("type", help="type literal text into the focused surface")
+    type_cmd.add_argument("text")
+    type_cmd.add_argument("--shot")
+    type_cmd.add_argument("--settle", type=float, default=0.3)
+
+    key_cmd = sub.add_parser("key", help="press key chords, e.g. ctrl+s Escape F12")
+    key_cmd.add_argument("chords", nargs="+")
+    key_cmd.add_argument("--shot")
+    key_cmd.add_argument("--settle", type=float, default=0.4)
+
+    scroll_cmd = sub.add_parser("scroll", help="scroll the pointer's surface")
+    scroll_cmd.add_argument("axis", choices=["v", "h", "vertical", "horizontal"])
+    scroll_cmd.add_argument("notches", type=float)
+    scroll_cmd.add_argument("--at", help="place the pointer at X,Y or a label first")
+    scroll_cmd.add_argument("--shot")
+    scroll_cmd.add_argument("--settle", type=float, default=0.4)
+
+    shot_cmd = sub.add_parser("shot", help="capture a settled frame")
+    shot_cmd.add_argument("name")
+    shot_cmd.add_argument("--scale", type=float, default=1.0)
+    shot_cmd.add_argument("--region", help="LEFT,TOP,RIGHT,BOTTOM in logical pixels")
+
+    wait_cmd = sub.add_parser("wait", help="wait for text to appear or disappear")
+    wait_cmd.add_argument("text")
+    wait_cmd.add_argument("--gone", action="store_true")
+    wait_cmd.add_argument("--timeout", type=float, default=25.0)
+
+    logs_cmd = sub.add_parser("logs", help="tail the application log")
+    logs_cmd.add_argument("--lines", type=int, default=40)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command == "session":
+            return session_command(args)
+
+        session = load_session(args.session)
+        do_heal = not args.no_heal
+
+        if args.command == "observe":
+            payload = observe(
+                session,
+                window_match=args.window,
+                do_heal=do_heal,
+                with_text=not args.no_text,
+            )
+            print(render(payload, as_json=args.json))
+            return 0
+
+        if args.command == "heal":
+            actions = heal(session, window_match=args.window)
+            painted = True
+            try:
+                wait_painted(session)
+            except HarnessError:
+                painted = False
+            print(
+                render(
+                    {"healed": actions or ["nothing to repair"], "painted": painted},
+                    as_json=args.json,
+                )
+            )
+            return 0
+
+        if do_heal:
+            heal(session, window_match=args.window)
+
+        if args.command == "click":
+            x, y, label = resolve_target(session, args.target, fresh=not args.stale_ok)
+            result = act(
+                session,
+                f"click {label} at {x},{y}",
+                lambda: click(session, x, y, button=args.button, double=args.double),
+                shot_name=args.shot,
+                settle=args.settle,
+            )
+            print(render(result, as_json=args.json))
+            return 0
+
+        if args.command == "type":
+            result = act(
+                session,
+                f"type {args.text!r}",
+                lambda: keyboard_text(session, args.text),
+                shot_name=args.shot,
+                settle=args.settle,
+            )
+            print(render(result, as_json=args.json))
+            return 0
+
+        if args.command == "key":
+            def press() -> None:
+                for chord in args.chords:
+                    keyboard_key(session, chord)
+                    time.sleep(0.12)
+
+            result = act(
+                session,
+                "key " + " ".join(args.chords),
+                press,
+                shot_name=args.shot,
+                settle=args.settle,
+            )
+            print(render(result, as_json=args.json))
+            return 0
+
+        if args.command == "scroll":
+            if args.at:
+                x, y, _ = resolve_target(session, args.at, fresh=True)
+                pointer(session, "a", str(x), str(y), ";", "w", "120")
+            result = act(
+                session,
+                f"scroll {args.axis} {args.notches}",
+                lambda: scroll(session, args.axis, args.notches),
+                shot_name=args.shot,
+                settle=args.settle,
+            )
+            print(render(result, as_json=args.json))
+            return 0
+
+        if args.command == "shot":
+            frame = wait_stable(session)
+            path = session.shots / args.name
+            image = load_image(frame)
+            if args.region:
+                left, top, right, bottom = (int(v) for v in args.region.split(","))
+                image = image.crop((left, top, right, bottom))
+            if args.scale != 1.0:
+                image = image.resize(
+                    (max(1, int(image.width * args.scale)), max(1, int(image.height * args.scale)))
+                )
+            image.save(path)
+            print(render({"shot": str(path), "size": f"{image.width}x{image.height}"}, as_json=args.json))
+            return 0
+
+        if args.command == "wait":
+            deadline = time.monotonic() + args.timeout
+            lowered = args.text.lower()
+            while time.monotonic() < deadline:
+                runs = ocr_runs(wait_stable(session, timeout=4.0))
+                present = any(lowered in r.text.lower() for r in runs)
+                if present != args.gone:
+                    print(
+                        render(
+                            {
+                                "text": args.text,
+                                "state": "gone" if args.gone else "present",
+                                "waited": round(args.timeout - (deadline - time.monotonic()), 2),
+                            },
+                            as_json=args.json,
+                        )
+                    )
+                    return 0
+                time.sleep(0.5)
+            raise HarnessError(
+                f"{args.text!r} was still "
+                f"{'present' if args.gone else 'absent'} after {args.timeout:g}s"
+            )
+
+        if args.command == "logs":
+            log = session.root / "session.log"
+            if not log.exists():
+                print("no application log yet")
+                return 0
+            lines = log.read_text(errors="replace").splitlines()
+            print("\n".join(lines[-args.lines :]))
+            return 0
+
+    except HarnessError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+    parser.error(f"unhandled command {args.command!r}")
+    return 2
+
+
+def session_command(args) -> int:
+    if args.session_command == "start":
+        command = args.cmd.strip()
+        if not command:
+            raise HarnessError("--cmd is empty")
+        overrides: dict[str, str] = {}
+        for entry in args.env:
+            key, _, value = entry.partition("=")
+            if not key:
+                raise HarnessError(f"bad --env {entry!r}; expected K=V")
+            overrides[key] = value
+        width: int | None = None
+        if args.width.strip().lower() != "host":
+            if not args.width.strip().isdigit():
+                raise HarnessError(f"bad --width {args.width!r}; expected pixels or 'host'")
+            width = int(args.width)
+        session = start_session(
+            args.name,
+            command,
+            root=Path(args.root).expanduser().resolve(),
+            portal=args.portal,
+            env_overrides=overrides,
+            timeout=args.timeout,
+            expect_window=not args.no_window_wait,
+            width=width,
+        )
+        if args.no_window_wait:
+            print(render({"session": args.name, "started": True}, as_json=args.json))
+            return 0
+        # `observe` heals, waits and reports whether anything was drawn, so a
+        # start needs nothing beyond it.
+        payload = observe(session, window_match=None, do_heal=True, with_text=False)
+        if session.fit:
+            payload["fit"] = session.fit
+        print(render(payload, as_json=args.json))
+        return 0
+
+    if args.session_command == "list":
+        rows = [
+            {
+                "name": s.name,
+                "display": s.display,
+                "pid": s.pid,
+                "alive": s.alive(),
+                "root": str(s.root),
+            }
+            for s in list_sessions()
+        ]
+        print(json.dumps(rows, indent=2) if args.json else "\n".join(
+            f"{r['name']:<16} {r['display']:<12} pid={r['pid']:<8} "
+            f"{'live' if r['alive'] else 'dead'} {r['root']}"
+            for r in rows
+        ) or "no sessions")
+        return 0
+
+    if args.session_command == "stop":
+        session = load_session(args.name or args.session)
+        print(render({"session": session.name, "result": stop_session(session)}, as_json=args.json))
+        return 0
+
+    if args.session_command == "env":
+        session = load_session(args.name or args.session)
+        for key, value in session.env.items():
+            print(f"export {key}={value}")
+        return 0
+
+    raise HarnessError(f"unknown session command {args.session_command!r}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

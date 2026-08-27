@@ -1,0 +1,50 @@
+// Configuration for the nested niri instance used to drive the application.
+//
+// Hot corners must be off: placing the virtual pointer absolutely works by
+// pinning it to the origin with a saturating relative move, and arriving at
+// the top-left corner would otherwise open the Overview and hide the window
+// under test. Animations are off so a screenshot taken right after an action
+// shows the settled state rather than a frame mid-transition.
+
+prefer-no-csd
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+// Key repeat must be off. `wtype` presses and releases a key faster than the
+// compositor's repeat detection settles, so a single injected keystroke is
+// read as a held key and repeats: typing "echo" delivered "eeeeeeeeeeechhh...".
+// A rate of zero disables repeat outright; the long delay is belt and braces.
+input {
+    keyboard {
+        repeat-delay 10000
+        repeat-rate 0
+    }
+}
+
+gestures {
+    hot-corners {
+        off
+    }
+}
+
+animations {
+    off
+}
+
+layout {
+    gaps 0
+
+    default-column-width {
+        proportion 1.0
+    }
+
+    focus-ring {
+        off
+    }
+
+    border {
+        off
+    }
+}
