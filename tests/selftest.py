@@ -413,6 +413,60 @@ def test_a_scaled_session_reports_both_geometries() -> None:
             H.stop_session(session)
 
 
+def test_typed_text_arrives_exactly() -> None:
+    """Typed text must reach the application byte for byte, or fail loudly.
+
+    This is the harness's most dangerous failure mode, because a dropped
+    character is indistinguishable from an application that mangled input: a
+    35-character commit message once arrived as 17 characters with no error
+    reported anywhere, and it was filed as a defect against the application
+    before the harness was caught. Read the text back from the application
+    itself rather than from OCR, so the assertion covers the whole path.
+    """
+    require("niri")
+    require("kitty")
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        raise _Skip("no host Wayland session")
+
+    # Shifted punctuation is included deliberately: reaching those characters
+    # needs a modifier, which is where a keymap mistake shows up as mojibake
+    # rather than as loss.
+    wanted = 'commit: fix "it" & <that> ~ 100% (#3) [a|b] {c} 0123456789'
+
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch) / "run"
+        readback = Path(scratch) / "typed.txt"
+        session = H.start_session(
+            "niri-harness-selftest-type",
+            f"exec kitty -- sh -c 'IFS= read -r line; printf %s \"$line\" > {readback}; sleep 600'",
+            root=root,
+            portal=None,
+            env_overrides={},
+            timeout=60.0,
+            width=None,
+        )
+        try:
+            H.wait_window(session, match=None)
+            H.keyboard_text(session, wanted)
+            H.keyboard_key(session, "Return")
+            deadline = time.monotonic() + 10
+            got = None
+            while time.monotonic() < deadline:
+                if readback.exists():
+                    got = readback.read_text(errors="replace")
+                    if got:
+                        break
+                time.sleep(0.2)
+            check("the application received the text", got is not None, "nothing was read back")
+            check(
+                "the text is byte-exact",
+                got == wanted,
+                f"got {got!r}, wanted {wanted!r}",
+            )
+        finally:
+            H.stop_session(session)
+
+
 def main() -> int:
     tests = [
         test_overlapping_tiles_do_not_double_report_a_word,
@@ -424,6 +478,7 @@ def main() -> int:
         test_a_click_is_converted_out_of_framebuffer_space,
         test_an_unscaled_session_is_left_alone,
         test_a_scaled_session_reports_both_geometries,
+        test_typed_text_arrives_exactly,
     ]
     only = sys.argv[1] if len(sys.argv) > 1 else None
     for test in tests:

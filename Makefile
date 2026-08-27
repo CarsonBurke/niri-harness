@@ -1,12 +1,16 @@
 PREFIX ?= $(CURDIR)
 BUILD  := $(CURDIR)/build
 
-WAYLAND_CFLAGS := $(shell pkg-config --cflags wayland-client)
-WAYLAND_LIBS   := $(shell pkg-config --libs wayland-client)
+WAYLAND_CFLAGS := $(shell pkg-config --cflags wayland-client xkbcommon)
+WAYLAND_LIBS   := $(shell pkg-config --libs wayland-client xkbcommon)
 
-PROTO_XML := protocols/wlr-virtual-pointer.xml
-PROTO_SRC := $(BUILD)/wlr-virtual-pointer-unstable-v1-protocol.c
-PROTO_HDR := $(BUILD)/wlr-virtual-pointer-unstable-v1-client-protocol.h
+PTR_XML := protocols/wlr-virtual-pointer.xml
+PTR_SRC := $(BUILD)/wlr-virtual-pointer-unstable-v1-protocol.c
+PTR_HDR := $(BUILD)/wlr-virtual-pointer-unstable-v1-client-protocol.h
+
+KBD_XML := protocols/virtual-keyboard.xml
+KBD_SRC := $(BUILD)/virtual-keyboard-unstable-v1-protocol.c
+KBD_HDR := $(BUILD)/virtual-keyboard-unstable-v1-client-protocol.h
 
 # Tesseract's English model and the one config the harness asks for. The
 # system package does not reliably ship the language data, and pointing
@@ -19,7 +23,7 @@ TESSDATA_URL := https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.trai
 
 .PHONY: all clean check
 
-all: $(BUILD)/vptr $(TESSDATA) $(TESSCONFIG)
+all: $(BUILD)/vptr $(BUILD)/vkbd $(TESSDATA) $(TESSCONFIG)
 
 $(TESSDATA):
 	@mkdir -p $(dir $@)
@@ -33,14 +37,24 @@ $(TESSCONFIG):
 $(BUILD):
 	@mkdir -p $(BUILD)
 
-$(PROTO_HDR): $(PROTO_XML) | $(BUILD)
+$(PTR_HDR): $(PTR_XML) | $(BUILD)
 	wayland-scanner client-header $< $@
 
-$(PROTO_SRC): $(PROTO_XML) | $(BUILD)
+$(PTR_SRC): $(PTR_XML) | $(BUILD)
 	wayland-scanner private-code $< $@
 
-$(BUILD)/vptr: src/vptr.c $(PROTO_SRC) $(PROTO_HDR) | $(BUILD)
-	$(CC) -O2 -Wall -I$(BUILD) -o $@ src/vptr.c $(PROTO_SRC) \
+$(KBD_HDR): $(KBD_XML) | $(BUILD)
+	wayland-scanner client-header $< $@
+
+$(KBD_SRC): $(KBD_XML) | $(BUILD)
+	wayland-scanner private-code $< $@
+
+$(BUILD)/vptr: src/vptr.c $(PTR_SRC) $(PTR_HDR) | $(BUILD)
+	$(CC) -O2 -Wall -I$(BUILD) -o $@ src/vptr.c $(PTR_SRC) \
+		$(WAYLAND_CFLAGS) $(WAYLAND_LIBS)
+
+$(BUILD)/vkbd: src/vkbd.c $(KBD_SRC) $(KBD_HDR) | $(BUILD)
+	$(CC) -O2 -Wall -I$(BUILD) -o $@ src/vkbd.c $(KBD_SRC) \
 		$(WAYLAND_CFLAGS) $(WAYLAND_LIBS)
 
 check: all

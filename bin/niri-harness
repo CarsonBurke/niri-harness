@@ -40,6 +40,7 @@ from pathlib import Path
 HARNESS_ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = HARNESS_ROOT / "build"
 VPTR = BUILD_DIR / "vptr"
+VKBD = BUILD_DIR / "vkbd"
 NESTED_CONFIG = HARNESS_ROOT / "share" / "nested.kdl"
 TESSDATA = HARNESS_ROOT / "share" / "tessdata"
 
@@ -98,12 +99,12 @@ def require_tool(name: str) -> str:
 
 
 def ensure_built() -> None:
-    """Build the pointer injector and fetch the OCR model, once, on demand.
+    """Build the input injectors and fetch the OCR model, once, on demand.
 
     A fresh clone carries source and no artefacts, so the first command that
     needs one runs `make` rather than telling the caller to.
     """
-    wanted = (VPTR, TESSDATA / "eng.traineddata", TESSDATA / "configs" / "tsv")
+    wanted = (VPTR, VKBD, TESSDATA / "eng.traineddata", TESSDATA / "configs" / "tsv")
     missing = [path for path in wanted if not path.exists()]
     if not missing:
         return
@@ -1122,9 +1123,27 @@ def click(session: Session, x: int, y: int, *, button: str = "left", double: boo
     pointer(session, *commands)
 
 
+# Text is typed by our own injector rather than by `wtype`. wtype reconnects
+# and re-uploads a keymap for every invocation, and switches keymaps mid-string
+# as characters demand: against a nested compositor that measured 2.8 seconds
+# per character and hung outright past about twenty characters, whereupon this
+# harness's own timeout killed it mid-string. The loss was SILENT - a
+# 35-character commit message arrived as 17 characters with no error - and it
+# cost one false defect report against the application under test before it was
+# caught. `vkbd` uploads one keymap and sends every key over one connection.
+#
+# Chords still go through wtype: they are one keystroke, so the per-invocation
+# cost is paid once and its modifier handling is already correct.
+KEYSTROKE_DELAY_MS = 4
+
+
 def keyboard_text(session: Session, text: str) -> None:
-    require_tool("wtype")
-    run(["wtype", "--", text], env=session.env, timeout=30)
+    ensure_built()
+    run(
+        [str(VKBD), "-d", str(KEYSTROKE_DELAY_MS), text],
+        env=session.env,
+        timeout=30 + len(text) * (KEYSTROKE_DELAY_MS / 1000 + 0.01),
+    )
 
 
 def keyboard_key(session: Session, chord: str) -> None:
