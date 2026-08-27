@@ -946,7 +946,7 @@ def merge_runs(runs: list[TextRun]) -> list[TextRun]:
     """Join words that sit on one baseline into a single clickable label.
 
     Tesseract in sparse mode returns words. A caller wants to click
-    "Open repository", not "Open" then "repository", and a label's own centre is
+    "Open repository", not "Open", and the centre of the whole label is
     a far better click target than the centre of its first word.
     """
     ordered = sorted(runs, key=lambda r: (r.y // 8, r.x))
@@ -992,7 +992,11 @@ def observe(
     except HarnessError:
         painted = False
     frame = wait_stable(session)
-    width, height, transform = output_geometry(session)
+    logical_w, logical_h, transform = output_geometry(session)
+    # Every coordinate in `runs` is a framebuffer pixel, because that is what a
+    # screenshot is, so the framebuffer is the geometry a caller reasons about.
+    # The logical size is what the application laid out against.
+    width, height = load_image(frame).size
     window = pick_window(session, window_match)
     runs = ocr_runs(frame) if with_text else []
     cache = session.root / "observed.json"
@@ -1008,7 +1012,13 @@ def observe(
     return {
         "session": session.name,
         "display": session.display,
-        "output": {"width": width, "height": height, "transform": transform},
+        "output": {
+            "width": width,
+            "height": height,
+            "transform": transform,
+            "scale": round(output_scale(session), 4),
+            "logical": {"width": logical_w, "height": logical_h},
+        },
         "window": {
             "id": window.get("id"),
             "app_id": window.get("app_id"),
@@ -1070,13 +1080,43 @@ def resolve_target(session: Session, target: str, *, fresh: bool) -> tuple[int, 
 # input
 
 
+def output_scale(session: Session) -> float:
+    """The factor between framebuffer pixels and the pointer's coordinate space.
+
+    Screenshots, and therefore every coordinate OCR reports, are framebuffer
+    pixels. The compositor places an absolute pointer in the output's LOGICAL
+    space, so in a scaled session the two differ and a click taken straight
+    from `observe` lands short of its target - silently, because a click on
+    nothing looks exactly like a click that did nothing.
+    """
+    for output in outputs(session):
+        scale = ((output.get("logical") or {}).get("scale")) or 0
+        if scale > 0:
+            return float(scale)
+    return 1.0
+
+
+def pointer_point(session: Session, x: int, y: int) -> tuple[int, int]:
+    """A framebuffer coordinate in the space the virtual pointer expects."""
+    scale = output_scale(session)
+    if abs(scale - 1.0) < 1e-6:
+        return x, y
+    return round(x / scale), round(y / scale)
+
+
 def pointer(session: Session, *args: str) -> None:
     ensure_built()
     run([str(VPTR), *args], env=session.env, timeout=30)
 
 
+def move_pointer(session: Session, x: int, y: int) -> None:
+    at_x, at_y = pointer_point(session, x, y)
+    pointer(session, "a", str(at_x), str(at_y), ";", "w", "120")
+
+
 def click(session: Session, x: int, y: int, *, button: str = "left", double: bool = False) -> None:
-    commands = ["a", str(x), str(y), ";", "w", "120", ";", "c", button]
+    at_x, at_y = pointer_point(session, x, y)
+    commands = ["a", str(at_x), str(at_y), ";", "w", "120", ";", "c", button]
     if double:
         commands += [";", "w", "60", ";", "c", button]
     pointer(session, *commands)
@@ -1147,9 +1187,17 @@ def render(payload: dict, *, as_json: bool) -> str:
     if "session" in payload and "window" in payload:
         output = payload["output"]
         window = payload["window"]
+        scale = output.get("scale") or 1.0
+        geometry = f"output={output['width']}x{output['height']}"
+        if abs(float(scale) - 1.0) > 1e-6:
+            logical = output.get("logical") or {}
+            geometry += (
+                f" (framebuffer; application viewport"
+                f" {logical.get('width')}x{logical.get('height')} at scale {scale})"
+            )
         lines.append(
             f"session={payload['session']} display={payload['display']} "
-            f"output={output['width']}x{output['height']} transform={output['transform']}"
+            f"{geometry} transform={output['transform']}"
         )
         lines.append(
             f"window={window['id']} {window['app_id']} "
@@ -1364,7 +1412,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "scroll":
             if args.at:
                 x, y, _ = resolve_target(session, args.at, fresh=True)
-                pointer(session, "a", str(x), str(y), ";", "w", "120")
+                move_pointer(session, x, y)
             result = act(
                 session,
                 f"scroll {args.axis} {args.notches}",

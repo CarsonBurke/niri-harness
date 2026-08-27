@@ -21,6 +21,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -297,6 +298,121 @@ def test_a_command_that_cannot_start_fails_immediately() -> None:
         )
 
 
+def test_a_click_is_converted_out_of_framebuffer_space() -> None:
+    """Every click coordinate must be divided by the output's scale.
+
+    Screenshots are framebuffer pixels, so every coordinate OCR reports is a
+    framebuffer pixel, but `zwlr_virtual_pointer_v1.motion_absolute` is mapped
+    by the compositor into the output's LOGICAL space. On a scaled output the
+    two differ, and an unconverted click silently lands short of its target -
+    which is indistinguishable from a click that landed and did nothing.
+
+    Verified against the real application before being pinned here: a click on
+    a button OCR located at framebuffer x=951 landed at x=798 without this.
+    """
+    sent: list[tuple[str, ...]] = []
+    original_pointer = H.pointer
+    original_scale = H.output_scale
+    H.pointer = lambda session, *args: sent.append(args)
+    H.output_scale = lambda session: 1.25
+    try:
+        H.click(None, 1000, 500)
+        H.move_pointer(None, 400, 200)
+    finally:
+        H.pointer = original_pointer
+        H.output_scale = original_scale
+
+    check("the click was sent", len(sent) == 2, f"{len(sent)} pointer calls")
+    if len(sent) != 2:
+        return
+    click_args, move_args = sent
+    check(
+        "the click is placed in logical space",
+        click_args[:3] == ("a", "800", "400"),
+        f"{click_args[:3]}, expected ('a', '800', '400')",
+    )
+    check("the click presses a button", "c" in click_args, str(click_args))
+    check(
+        "a bare move is converted too",
+        move_args[:3] == ("a", "320", "160"),
+        f"{move_args[:3]}, expected ('a', '320', '160')",
+    )
+
+
+def test_an_unscaled_session_is_left_alone() -> None:
+    """The conversion must be exact at scale 1, not merely close."""
+    sent: list[tuple[str, ...]] = []
+    original_pointer = H.pointer
+    original_scale = H.output_scale
+    H.pointer = lambda session, *args: sent.append(args)
+    H.output_scale = lambda session: 1.0
+    try:
+        H.click(None, 1001, 503)
+    finally:
+        H.pointer = original_pointer
+        H.output_scale = original_scale
+
+    check(
+        "coordinates pass through untouched",
+        bool(sent) and sent[0][:3] == ("a", "1001", "503"),
+        str(sent[:1]),
+    )
+
+
+def test_a_scaled_session_reports_both_geometries() -> None:
+    """`observe` must say which space its coordinates are in.
+
+    A caller reading `output=1596x1762` while `runs` hold framebuffer pixels up
+    to 1902 has no way to know the two disagree, so the framebuffer size is
+    what `observe` reports, with the logical viewport named alongside it.
+    """
+    require("niri")
+    require("kitty")
+    require("tesseract")
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        raise _Skip("no host Wayland session")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        session = H.start_session(
+            "niri-harness-selftest-scale",
+            "exec kitty -- sh -c 'printf \"SCALEPROBE\\n\"; sleep 600'",
+            root=Path(scratch) / "run",
+            portal=None,
+            env_overrides={},
+            timeout=60.0,
+            width=1600,
+        )
+        try:
+            payload = H.observe(session, window_match=None, do_heal=True, with_text=True)
+            output = payload["output"]
+            frame_w, frame_h = H.load_image(Path(payload["frame"])).size
+            check(
+                "the reported size is the framebuffer",
+                (output["width"], output["height"]) == (frame_w, frame_h),
+                f"reported {output['width']}x{output['height']}, frame {frame_w}x{frame_h}",
+            )
+            check("the scale is reported", output.get("scale"), str(output.get("scale")))
+            logical = output.get("logical") or {}
+            # The scale is derived from the output's mode, which the host may
+            # report a pixel or two away from the screenshot it hands back, so
+            # the relation is asserted rather than an exact identity.
+            reconstructed = (logical.get("width") or 0) * (output.get("scale") or 0)
+            check(
+                "the logical viewport times the scale is the framebuffer",
+                abs(reconstructed - frame_w) <= 3,
+                f"logical {logical} x scale {output.get('scale')} = {reconstructed:.1f}, frame width {frame_w}",
+            )
+            runs = payload.get("runs") or []
+            check("text was located", bool(runs), f"{len(runs)} runs")
+            check(
+                "located text is inside the reported geometry",
+                all(0 <= r.x <= frame_w and 0 <= r.y <= frame_h for r in runs),
+                f"{len(runs)} runs against {frame_w}x{frame_h}",
+            )
+        finally:
+            H.stop_session(session)
+
+
 def main() -> int:
     tests = [
         test_overlapping_tiles_do_not_double_report_a_word,
@@ -305,6 +421,9 @@ def main() -> int:
         test_ocr_reads_both_polarities,
         test_a_command_that_cannot_start_fails_immediately,
         test_a_session_runs_an_application_and_its_text_is_readable,
+        test_a_click_is_converted_out_of_framebuffer_space,
+        test_an_unscaled_session_is_left_alone,
+        test_a_scaled_session_reports_both_geometries,
     ]
     only = sys.argv[1] if len(sys.argv) > 1 else None
     for test in tests:
