@@ -5,9 +5,9 @@ Two layers:
 
 * Pure tests over the OCR and label-matching logic. They synthesise their own
   images, so they are fast, deterministic and need no compositor.
-* One end-to-end test that starts a real nested session running a real
-  application and reads its text back. It is skipped, loudly, when `niri`,
-  `kitty` or a host Wayland session is unavailable.
+* End-to-end tests that start real nested sessions running real applications
+  and drive them. Each is skipped, loudly, when what it needs - `niri`, a
+  terminal, GTK, a host Wayland session - is unavailable.
 
 Nothing here touches the caller's desktop: the nested session owns its own
 compositor, its own output and its own pointer.
@@ -111,6 +111,123 @@ def test_words_on_one_baseline_become_one_label() -> None:
     # A wide horizontal gap is a different label on the same baseline.
     columns = H.merge_runs([run_at("Name", 10, 100, width=40), run_at("Modified", 900, 100, width=60)])
     check("distant columns kept apart", len(columns) == 2, f"got {[r.text for r in columns]}")
+
+
+# --------------------------------------------------------------------------
+# command line
+
+
+def test_shared_options_are_accepted_either_side_of_the_command() -> None:
+    parser = H.build_parser()
+    after = parser.parse_args(["observe", "--json", "--session", "app"])
+    check("after the command", after.json and after.session == "app", str(after))
+    before = parser.parse_args(["--json", "--observer", "ocr", "observe"])
+    check("before it", before.json and before.observer == "ocr", str(before))
+    # A subcommand's copy must not overwrite what the top-level copy parsed.
+    check("an option given before is not reset after",
+          before.session is None and before.json, str(before))
+    plain = parser.parse_args(["click", "Save"])
+    check("and the defaults hold when neither is given",
+          not plain.json and plain.observer == "auto" and plain.session is None,
+          str(plain))
+
+
+def test_start_takes_the_program_and_its_arguments_verbatim() -> None:
+    parser = H.build_parser()
+    args = parser.parse_args(["start", "--width", "1200", "./app", "--name", "-x"])
+    check("options before the program are the harness's",
+          args.width == "1200" and args.name is None, str(args))
+    check("everything from the program on is the program's",
+          args.argv == ["./app", "--name", "-x"], str(args.argv))
+
+
+def test_a_session_is_named_after_its_program() -> None:
+    live = {"my-app", "my-app-2"}
+
+    class Record:
+        def __init__(self, name):
+            self.name = name
+
+        def alive(self):
+            return self.name in live
+
+    original_file, original_load = H.session_file, H.load_session
+    with tempfile.TemporaryDirectory() as scratch:
+        records = Path(scratch)
+        for name in ("my-app", "my-app-2", "stale"):
+            (records / f"{name}.json").write_text("{}")
+        H.session_file = lambda name: records / f"{name}.json"
+        H.load_session = Record
+        try:
+            check("a live name is suffixed until it is free",
+                  H.unique_session_name("./target/debug/my-app") == "my-app-3",
+                  H.unique_session_name("./target/debug/my-app"))
+            check("a dead one is reused",
+                  H.unique_session_name("/usr/bin/stale") == "stale",
+                  H.unique_session_name("/usr/bin/stale"))
+            name = H.unique_session_name("/opt/My App!")
+            check("and the name is safe as a file name",
+                  name == "My-App" and bool(H.SESSION_NAME.fullmatch(name)), name)
+        finally:
+            H.session_file, H.load_session = original_file, original_load
+
+
+def test_an_action_reports_in_one_line() -> None:
+    def line(fraction, changed, shot=None):
+        return H.describe_change({"action": "click a1 'Save' at 5,5",
+                                  "frame_changed_fraction": fraction,
+                                  "changed": changed, "shot": shot})
+
+    check("a change says how much", line(0.99996, True) == "click a1 'Save' at 5,5: changed 100%",
+          line(0.99996, True))
+    check("a small one keeps its precision", line(0.0345, True).endswith("changed 3.5%"),
+          line(0.0345, True))
+    # Typing a few characters moves fewer pixels than the noise floor. That is
+    # not the same as nothing, and a caller expecting a change must see which.
+    check("a change within noise is told apart from none",
+          line(0.0012, False).endswith("no change (0.12% differs, within noise)")
+          and line(0.0, False).endswith(": no change"),
+          f"{line(0.0012, False)} / {line(0.0, False)}")
+    check("a kept shot is named on the same line",
+          line(0.5, True, "/r/shots/a.png").endswith("changed 50%; shot /r/shots/a.png")
+          and "\n" not in line(0.5, True, "/r/shots/a.png"),
+          line(0.5, True, "/r/shots/a.png"))
+
+
+def test_an_observation_leads_with_the_window_and_nothing_else() -> None:
+    payload = {
+        "session": "app", "display": "wayland-2", "frame": "/r/shots/_observed.png",
+        "output": {"width": 1600, "height": 1000, "transform": "Normal", "scale": 1.0},
+        "window": {"id": 2, "app_id": "org.example.App", "title": "App",
+                   "size": [1600, 1000], "focused": True},
+        "healed": [], "painted": True, "source": "a11y+ocr", "forgone": None,
+        "runs": [H.TextRun(ref="a1", text="Save", x=5, y=6, width=40, height=20,
+                           confidence=100.0, role="push button")],
+    }
+    lines = H.describe_observation(payload).splitlines()
+    check("one line of window, one of heading, one per target",
+          len(lines) == 3 and lines[0] == "window org.example.App 'App' 1600x1000",
+          str(lines))
+    check("the target keeps its ref and role",
+          "[a1]" in lines[-1] and "Save [push button]" in lines[-1], lines[-1])
+
+    # Scaled, the coordinates stop being the window's own pixels, and that is
+    # the one fact about the output a caller cannot do without.
+    payload["output"] = {"width": 1905, "height": 2110, "transform": "Normal",
+                         "scale": 1.191}
+    payload["runs"] = []
+    lines = H.describe_observation(payload).splitlines()
+    check("a scaled output says what the coordinates are",
+          "framebuffer pixels of a 1905x2110 output at scale 1.191" in lines[0],
+          lines[0])
+    check("and an empty listing says so rather than stopping short",
+          lines[-1].startswith("no targets"), str(lines))
+
+    # `--no-text` looked for nothing, which is not the same as finding nothing.
+    payload["source"] = None
+    lines = H.describe_observation(payload).splitlines()
+    check("an observation that looked for nothing claims nothing",
+          not any("targets" in line for line in lines), str(lines))
 
 
 # --------------------------------------------------------------------------
@@ -1123,8 +1240,8 @@ def test_stopping_a_session_strands_no_accessibility_processes() -> None:
         harness = [sys.executable, str(Path(H.__file__).resolve())]
         name = "niri-harness-selftest-sweep"
         started_ok = subprocess.run(
-            harness + ["session", "start", name, "--root", str(root),
-                       "--cmd", "exec alacritty -e sh -c 'sleep 600'"],
+            harness + ["start", "--name", name, "--root", str(root),
+                       "alacritty", "-e", "sh", "-c", "sleep 600"],
             env=environment, capture_output=True, text=True, check=False,
         )
         try:
@@ -1138,7 +1255,7 @@ def test_stopping_a_session_strands_no_accessibility_processes() -> None:
             check("the session starts its own accessibility bus", bool(started),
                   str(sorted(started)))
         finally:
-            subprocess.run(harness + ["session", "stop", name],
+            subprocess.run(harness + ["stop", name],
                            env=environment, capture_output=True, check=False)
 
     # Reaping is not instantaneous; the sweep signals and the kernel follows.
@@ -1676,6 +1793,11 @@ def test_heal_claims_no_repair_it_did_not_make() -> None:
 
 def main() -> int:
     tests = [
+        test_shared_options_are_accepted_either_side_of_the_command,
+        test_start_takes_the_program_and_its_arguments_verbatim,
+        test_a_session_is_named_after_its_program,
+        test_an_action_reports_in_one_line,
+        test_an_observation_leads_with_the_window_and_nothing_else,
         test_overlapping_tiles_do_not_double_report_a_word,
         test_words_on_one_baseline_become_one_label,
         test_a_label_is_matched_exactly_before_partially,

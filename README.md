@@ -10,26 +10,23 @@ for coding agents that need to verify GUI changes without reading screenshots,
 and it works just as well from a shell script or a test suite.
 
 ```console
-$ niri-harness session start app --root /tmp/run --cmd 'exec ./target/debug/my-app'
-session=app display=wayland-2 output=1600x1000 transform=Normal
-window=2 dev.example.MyApp size=[1600, 1000] focused=True title='My App'
-fit: viewport 1600x1000 at scale 1 (headless; no host window)
+$ niri-harness start ./target/debug/my-app
+started my-app in /home/you/.cache/niri-harness/my-app
+window dev.example.MyApp 'My App' 1600x1000
 
 $ niri-harness observe
-...
-controls the application declares, then what is only on screen (12):
+window dev.example.MyApp 'My App' 1600x1000
+12 targets from the accessibility tree, then read from the screen:
   [a1]    39,    0   75x35  Open repository [push button]
   [a2]   822,   41  233x34  src/main.rs [page tab]
   [a5]  1438,  143   89x34  Build [push button] (disabled)
   ...
 
-$ niri-harness click "Open repository" --settle 3
-action=click a1 push button 'Open repository' at 76,17
-frame_changed_fraction=0.99996
-changed=True
-...
+$ niri-harness click "Open repository"
+click a1 push button 'Open repository' at 76,17: changed 100%
 
-$ niri-harness session stop app
+$ niri-harness stop
+my-app stopped
 ```
 
 ## Why
@@ -43,8 +40,8 @@ niri-harness replaces that loop with:
 - **Named targets.** Controls come from the application's accessibility tree,
   with OCR as the fallback, so you write `click Save`, not `click 812,44`.
 - **Evidence you can check.** Every action reports how much of the frame
-  changed. `changed=False` after a click that should have done something is a
-  real finding, not a guess.
+  changed. `no change` after a click that should have done something is a real
+  finding, not a guess.
 - **Full isolation.** By default, your windows, focus, pointer, clipboard and D-Bus session
   are never touched, so a run can go on while you keep working.
 
@@ -81,18 +78,23 @@ needs a build artifact.
 ### 1. Start a session
 
 ```console
-$ niri-harness session start NAME --root DIR --cmd 'CMD'
+$ niri-harness start [OPTIONS] PROGRAM [ARG...]
 ```
 
-This starts a nested compositor, runs `CMD` through a shell inside it, and
-waits for a window to appear. `DIR` receives the logs, screenshots and state
-for the session. If the command exits without mapping a window, `start` fails
-at once with its exit status and the end of the log. If it keeps running but
-never maps one, `start` fails after `--timeout`. A failed start is not left
-registered.
+This starts a nested compositor, runs the program inside it from your current
+directory, and waits for a window to appear. The program and its arguments are
+passed as they are, without a shell; for shell syntax, start `sh -c '...'`.
+Options for the harness go before the program, and everything from the program
+on belongs to it.
+
+If the program exits without mapping a window, `start` fails at once with its
+exit status and the end of its output. If it keeps running but never maps one,
+`start` fails after `--timeout`. A failed start is not left registered.
 
 | Option | Effect |
 | --- | --- |
+| `--name NAME` | Session name. Defaults to the program's name, with `-2`, `-3`... added if that one is running. |
+| `--root DIR` | Where logs and screenshots go. Defaults to `~/.cache/niri-harness/NAME`, cleared of old logs on each start. |
 | `--width PX` | Logical width the app lays out against (default 1600; 320 to 7680 headless). `host` accepts whatever size the backend gives. |
 | `--backend window` | Draw into a visible window on your desktop instead of headless `Xvfb`, so you can watch. |
 | `--host-bus` | Share your D-Bus session instead of getting a private one. This also turns off the accessibility tree, so the session uses OCR only. |
@@ -101,10 +103,11 @@ registered.
 | `--no-window-wait` | Return once the compositor is up, for commands that never open a window. |
 | `--timeout SECONDS` | How long to wait for the window (default 40). |
 
-`session list` shows sessions and `session stop [NAME]` tears one down.
-`session env NAME` prints `export` lines for the nested `WAYLAND_DISPLAY` and
-`NIRI_SOCKET`, so you can point your own Wayland tools at the session. The
-session's private D-Bus address is in `DIR/session.bus`.
+`list` shows sessions and `stop [NAME]` tears one down. `env [NAME]` prints
+`export` lines for the session's `WAYLAND_DISPLAY`, `NIRI_SOCKET` and private
+`DBUS_SESSION_BUS_ADDRESS`, so you can point your own tools at it:
+`eval "$(niri-harness env)"`. Like every other command, these pick the only
+running session when you do not name one.
 
 ### 2. Look
 
@@ -112,11 +115,13 @@ session's private D-Bus address is in `DIR/session.bus`.
 $ niri-harness observe
 ```
 
-This prints the window's geometry and every control or text run it can find.
-Each one has a reference: `aN` for controls from the accessibility tree and
-`tN` for text read off the screen. It also reports `painted`, which flags a
-blank window. A blank window usually means the application is stuck.
-`--no-text` skips OCR.
+This prints the window it is looking at, then every control or text run it can
+find. Each one has a reference: `aN` for controls from the accessibility tree
+and `tN` for text read off the screen. Anything unusual gets a line of its own:
+a repair `heal` made, `painted=False` for a near-blank window (often a stuck
+app, though a dark, empty terminal looks the same), or why the accessibility
+tree was not used. `--no-text` skips OCR. The frame it looked at is saved as
+`ROOT/shots/_observed.png`.
 
 ### 3. Act
 
@@ -133,8 +138,18 @@ blank window. A blank window usually means the application is stuck.
 | `logs` | Show the end of the application's output. `--lines`. |
 
 `click`, `type`, `key`, `scroll` and `drag` accept `--settle SECONDS` to wait
-for the UI to settle and `--shot NAME` to keep the resulting frame. They all
-report `frame_changed_fraction` and `changed`.
+for the UI to settle and `--shot NAME` to keep the resulting frame. Each prints
+one line: what it did and how much of the frame changed.
+
+```text
+click a1 push button 'Save' at 76,17: changed 4.2%
+type 'hello': no change (0.03% differs, within noise)
+key ctrl+s: no change
+```
+
+A handful of typed characters in a large window can fall under the noise
+floor, which is why that case gets its own wording. `--json` gives the exact
+`frame_changed_fraction` and `changed`.
 
 ### Targets
 
@@ -158,9 +173,10 @@ Pass its coordinates if you want to click it anyway.
 OCR sometimes glues an icon onto a label, so you might see `M © src/main.rs`.
 Substring matching means `click src/main.rs` still works.
 
-### Global options
+### Shared options
 
-Put these **before** the subcommand, e.g. `niri-harness --json observe`.
+These go before the command, or after it when the command uses them:
+`niri-harness observe --json` and `niri-harness --json observe` are the same.
 
 | Option | Effect |
 | --- | --- |
@@ -215,7 +231,7 @@ Each session gets:
 Screenshots use `grim`'s screencopy protocol rather than niri's screenshot
 action, so they never touch your clipboard or send notifications.
 
-`session stop` kills the session's whole process group, including the
+`stop` kills the session's whole process group, including the
 accessibility bus, which otherwise outlives the app. Before it signals
 anything, it checks both the recorded pid and that process's start time, so a
 stale record can never kill an unrelated process that has reused the pid.
@@ -229,10 +245,11 @@ keys.
 
 - **A dialog keeps losing focus.** `heal` focuses the main window before every
   action. Pass `--no-heal` while you work with a modal dialog.
-- **`click` says `changed=False`.** Either the click did nothing, which is worth
+- **`click` says `no change`.** Either the click did nothing, which is worth
   investigating, or the UI needed longer. Retry with `--settle 2`.
 - **`start` fails with "exited with status N without mapping a window".**
-  Read the log tail it prints. If the app is single-instance, check that you did not pass
+  Read the output it prints, or the whole of `ROOT/session.log`; the error
+  names the file. If the app is single-instance, check that you did not pass
   `--host-bus`.
 - **A control is missing from `observe`.** It may be disabled, off screen, or
   unreadable to OCR at the current size. Try `--observer ocr`, or a larger
@@ -269,4 +286,7 @@ tests/                self-test
 ```
 
 Session records live in `$XDG_RUNTIME_DIR/niri-harness`. Set
-`NIRI_HARNESS_STATE` to use a different directory.
+`NIRI_HARNESS_STATE` to use a different directory. A session's root holds
+`session.log` (the application's output, which `logs` reads), `bus.log` (its
+private D-Bus daemon and the services that daemon starts),
+`compositor.log`, and `shots/`.

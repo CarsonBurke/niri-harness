@@ -51,6 +51,17 @@ STATE_DIR = Path(
     or (Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "niri-harness")
 )
 
+# Where a session keeps its logs and shots when `start` is not given `--root`.
+# Not the runtime directory the records live in: that is RAM-backed, and a
+# session's screenshots accumulate for as long as it runs.
+DEFAULT_ROOTS = (
+    Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "niri-harness"
+)
+
+# A session name becomes a file name and a directory name, so it is held to
+# characters that are safe as both.
+SESSION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
 # A frame is considered painted once this fraction of sampled pixels differ
 # from the single most common value. A window that is mapped but has not yet
 # drawn is a uniform rectangle, and clicking into it is silently lost.
@@ -352,7 +363,7 @@ def dead_session_report(known: list["Session"]) -> str:
     closed the window under it.
     """
     if not known:
-        return "no live session; start one with `session start`"
+        return "no live session; start one with `niri-harness start PROGRAM`"
     lines = ["no live session; the most recent one has died"]
     for session in known[-2:]:
         lines.append(f"session {session.name} pid={session.pid} root={session.root}")
@@ -369,7 +380,7 @@ def dead_session_report(known: list["Session"]) -> str:
             for line in tail:
                 if line.strip():
                     lines.append(f"  {label}: {line.strip()}")
-    lines.append("restart with `session start`")
+    lines.append("restart with `niri-harness start`")
     return "\n".join(lines)
 
 
@@ -763,6 +774,16 @@ def start_session(
         existing.unlink()
 
     root.mkdir(parents=True, exist_ok=True)
+    # A root outlives its session, and the default one is reused by every
+    # session of the same name. Its logs are appended to, so without this a
+    # failed start would quote the previous run's output as its own cause.
+    # Its last observation goes too: `click t2` resolves against it, and
+    # against a previous run's screen it would click without complaint.
+    for stale in (
+        "session.log", "compositor.log", "xvfb.log", "a11y.log", "bus.log",
+        "observed.json", "shots/_observed.png",
+    ):
+        (root / stale).unlink(missing_ok=True)
     handshake = root / "session.env"
     handshake.unlink(missing_ok=True)
     status = root / "session.rc"
@@ -2678,66 +2699,97 @@ def act(
 # rendering
 
 
-def render(payload: dict, *, as_json: bool) -> str:
+def emit(payload: dict | list, text: str, *, as_json: bool) -> None:
+    """Print a command's result: its payload under `--json`, else one summary.
+
+    The text is for reading, so it says what happened and leaves out what did
+    not: the JSON keeps every field, the text only the ones worth a line.
+    """
     if as_json:
-        return json.dumps(payload, default=lambda o: o.__dict__, indent=2)
-    lines: list[str] = []
-    if "session" in payload and "window" in payload:
-        output = payload["output"]
-        window = payload["window"]
-        scale = output.get("scale") or 1.0
-        geometry = f"output={output['width']}x{output['height']}"
-        if abs(float(scale) - 1.0) > 1e-6:
-            logical = output.get("logical") or {}
-            geometry += (
-                f" (framebuffer; application viewport"
-                f" {logical.get('width')}x{logical.get('height')} at scale {scale})"
-            )
-        lines.append(
-            f"session={payload['session']} display={payload['display']} "
-            f"{geometry} transform={output['transform']}"
+        print(json.dumps(payload, default=lambda o: o.__dict__, indent=2))
+    else:
+        print(text)
+
+
+def describe_change(result: dict) -> str:
+    """One line for an action: what was done and what it did to the screen."""
+    share = result["frame_changed_fraction"] * 100
+    percent = f"{share:.0f}%" if share >= 10 else f"{share:.2g}%"
+    if result["changed"]:
+        effect = f"changed {percent}"
+    elif result["frame_changed_fraction"]:
+        # Typing a few characters into a large window moves this few pixels.
+        # Below the noise floor, but not nothing, and a caller who expected a
+        # change needs to tell the two apart.
+        effect = f"no change ({percent} differs, within noise)"
+    else:
+        effect = "no change"
+    line = f"{result['action']}: {effect}"
+    if result.get("shot"):
+        line += f"; shot {result['shot']}"
+    return line
+
+
+def describe_window(payload: dict) -> str:
+    """The window acted on, and the space the coordinates are in when that is
+    not simply the window's own size at scale 1."""
+    window = payload["window"]
+    output = payload["output"]
+    size = window.get("size") or [output["width"], output["height"]]
+    line = f"window {window['app_id']} {window['title']!r} {size[0]}x{size[1]}"
+    if not window.get("focused"):
+        line += " (not focused)"
+    scale = output.get("scale") or 1.0
+    if abs(float(scale) - 1.0) > 1e-6:
+        line += (
+            f"; coordinates are framebuffer pixels of a"
+            f" {output['width']}x{output['height']} output at scale {scale}"
         )
+    return line
+
+
+def describe_warnings(payload: dict) -> list[str]:
+    lines = []
+    if payload.get("painted") is False:
+        lines.append("painted=False (output is near-uniform; the window may still be blank)")
+    if payload.get("forgone"):
         lines.append(
-            f"window={window['id']} {window['app_id']} "
-            f"size={window['size']} focused={window['focused']} title={window['title']!r}"
+            f"the application's accessibility tree was not used: {payload['forgone']}"
         )
-        if payload.get("painted") is False:
-            lines.append(
-                "painted=False (output is near-uniform; the window may still be blank)"
-            )
-        if payload.get("fit"):
-            lines.append(f"fit: {payload['fit']}")
-        if payload.get("healed"):
-            lines.append("healed: " + "; ".join(payload["healed"]))
-        lines.append(f"frame={payload['frame']}")
-        if payload.get("forgone"):
-            lines.append(
-                "the application's accessibility tree was not used: "
-                f"{payload['forgone']}"
-            )
-        runs = payload.get("runs") or []
-        if runs:
-            source = payload.get("source")
-            heading = {
-                "a11y": "controls, from the application's accessibility tree",
-                "ocr": "text runs, read off the screen",
-                "a11y+ocr": "controls the application declares, then what is"
-                " only on screen",
-            }.get(source, "text runs")
-            lines.append(f"{heading} ({len(runs)}):")
-            for run_ in runs:
-                data = run_ if isinstance(run_, dict) else run_.__dict__
-                role = data.get("role", "ocr")
-                note = "" if role == "ocr" else f" [{role}]"
-                if data.get("enabled") is False:
-                    note += " (disabled)"
-                lines.append(
-                    f"  [{data['ref']}] {data['x']:>5},{data['y']:>5} "
-                    f"{data['width']:>4}x{data['height']:<3} {data['text']}{note}"
-                )
+    return lines
+
+
+RUN_SOURCES = {
+    "a11y": "from the accessibility tree",
+    "ocr": "read from the screen",
+    "a11y+ocr": "from the accessibility tree, then read from the screen",
+}
+
+
+def describe_observation(payload: dict) -> str:
+    lines = [describe_window(payload)]
+    if payload.get("healed"):
+        lines.append("healed: " + "; ".join(payload["healed"]))
+    lines += describe_warnings(payload)
+    if payload.get("source") is None:
+        # `--no-text`: nothing was looked for, so there is nothing to report.
         return "\n".join(lines)
-    for key, value in payload.items():
-        lines.append(f"{key}={value}")
+    runs = payload.get("runs") or []
+    source = RUN_SOURCES.get(payload.get("source"), "found")
+    if not runs:
+        lines.append(f"no targets {source}")
+        return "\n".join(lines)
+    lines.append(f"{len(runs)} targets {source}:")
+    for run_ in runs:
+        data = run_ if isinstance(run_, dict) else run_.__dict__
+        role = data.get("role", "ocr")
+        note = "" if role == "ocr" else f" [{role}]"
+        if data.get("enabled") is False:
+            note += " (disabled)"
+        lines.append(
+            f"  [{data['ref']}] {data['x']:>5},{data['y']:>5} "
+            f"{data['width']:>4}x{data['height']:<3} {data['text']}{note}"
+        )
     return "\n".join(lines)
 
 
@@ -2783,38 +2835,84 @@ def crop_region(image: "Image.Image", spec: str) -> "Image.Image":
 # command line
 
 
+def add_common_options(parser: argparse.ArgumentParser, *names: str, top: bool) -> None:
+    """Give a parser the options every command shares.
+
+    They are accepted after the subcommand as well as before it, so
+    `observe --json` works as well as `--json observe`. A subcommand's copy
+    defaults to SUPPRESS: left unset, it must not overwrite a value the
+    top-level copy already parsed.
+    """
+
+    def default(value):
+        return value if top else argparse.SUPPRESS
+
+    options = {
+        "--session": lambda: parser.add_argument(
+            "--session", default=default(None),
+            help="session name (default: the only live one)",
+        ),
+        "--window": lambda: parser.add_argument(
+            "--window", default=default(None),
+            help="substring matching app_id or title",
+        ),
+        "--json": lambda: parser.add_argument(
+            "--json", action="store_true", default=default(False),
+            help="machine-readable output",
+        ),
+        "--no-heal": lambda: parser.add_argument(
+            "--no-heal", action="store_true", default=default(False),
+            help="skip the pre-action repair pass",
+        ),
+        "--observer": lambda: parser.add_argument(
+            "--observer", choices=["auto", "a11y", "ocr"], default=default("auto"),
+            help=(
+                "where labels come from: auto combines the application's"
+                " accessibility tree with the screen, a11y asks only the tree,"
+                " ocr reads only the screen"
+            ),
+        ),
+    }
+    for name in names or options:
+        options[name]()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="niri-harness",
         description="Drive a desktop app in an isolated nested niri session.",
     )
-    parser.add_argument("--session", help="session name (default: the only live one)")
-    parser.add_argument("--window", help="substring matching app_id or title")
-    parser.add_argument("--json", action="store_true", help="machine-readable output")
-    parser.add_argument(
-        "--no-heal", action="store_true", help="skip the pre-action repair pass"
-    )
-    parser.add_argument(
-        "--observer",
-        choices=["auto", "a11y", "ocr"],
-        default="auto",
-        help=(
-            "where labels come from: auto asks the application's accessibility"
-            " tree and reads the screen when it declares nothing, a11y asks only"
-            " the tree, ocr reads only the screen"
-        ),
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
+    add_common_options(parser, top=True)
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    session = sub.add_parser("session", help="manage nested sessions")
-    session_sub = session.add_subparsers(dest="session_command", required=True)
-    start = session_sub.add_parser("start", help="start a nested session running a command")
-    start.add_argument("name")
-    start.add_argument("--root", required=True, help="directory for logs, shots and state")
+    def command(name: str, help: str, *common: str, **kwargs) -> argparse.ArgumentParser:
+        parsed = sub.add_parser(name, help=help, **kwargs)
+        add_common_options(parsed, *common, top=False)
+        return parsed
+
+    acting = ("--session", "--window", "--json", "--no-heal", "--observer")
+
+    start = command(
+        "start", "start an application in a new nested session", "--json",
+        usage="%(prog)s [options] PROGRAM [ARG...]",
+    )
     start.add_argument(
-        "--portal",
-        choices=sorted(PORTAL_BACKENDS),
-        help="run on a private bus so portal dialogs appear inside the session",
+        "--name", help="session name (default: the program's name, made unique)"
+    )
+    start.add_argument(
+        "--root",
+        help=f"directory for logs, shots and state (default: {DEFAULT_ROOTS}/NAME)",
+    )
+    start.add_argument(
+        "--width",
+        default="1600",
+        metavar="PX",
+        help=(
+            "logical width the application lays out against. A headless session"
+            " is built at that size exactly; a window session trades the nested"
+            " output's scale for it. 'host' takes whatever the backend gives,"
+            " which headless has no host to ask and so sizes at its own default"
+        ),
     )
     start.add_argument(
         "--backend",
@@ -2832,6 +2930,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="share the caller's D-Bus session instead of giving the session its own",
     )
+    start.add_argument(
+        "--portal",
+        choices=sorted(PORTAL_BACKENDS),
+        help="run on a private bus so portal dialogs appear inside the session",
+    )
     start.add_argument("--env", action="append", default=[], metavar="K=V")
     start.add_argument("--timeout", type=float, default=40.0)
     start.add_argument(
@@ -2840,33 +2943,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="return as soon as the compositor is up, for a command with no window",
     )
     start.add_argument(
-        "--cmd",
-        required=True,
-        help="shell command to run inside the session, e.g. 'cd /repo && exec ./app'",
-    )
-    start.add_argument(
-        "--width",
-        default="1600",
-        metavar="PX",
+        "argv",
+        nargs=argparse.REMAINDER,
+        metavar="PROGRAM [ARG...]",
         help=(
-            "logical width the application lays out against. A headless session"
-            " is built at that size exactly; a window session trades the nested"
-            " output's scale for it. 'host' takes whatever the backend gives,"
-            " which headless has no host to ask and so sizes at its own default"
+            "run in the current directory without a shell; for one, pass"
+            " sh -c '...'"
         ),
     )
-    session_sub.add_parser("list", help="list known sessions")
-    stop = session_sub.add_parser("stop", help="stop a session")
+
+    command("list", "list known sessions", "--json")
+    stop = command("stop", "stop a session", "--session", "--json")
     stop.add_argument("name", nargs="?")
-    env_cmd = session_sub.add_parser("env", help="print a session's nested environment")
+    env_cmd = command("env", "print a session's nested environment", "--session")
     env_cmd.add_argument("name", nargs="?")
 
-    observe_cmd = sub.add_parser("observe", help="window geometry plus located text")
+    observe_cmd = command("observe", "window geometry plus located text", *acting)
     observe_cmd.add_argument("--no-text", action="store_true", help="skip OCR")
 
-    heal_cmd = sub.add_parser("heal", help="repair input-swallowing states")
+    command("heal", "repair input-swallowing states", *acting)
 
-    click_cmd = sub.add_parser("click", help="click a ref, a visible label, or X,Y")
+    click_cmd = command("click", "click a ref, a visible label, or X,Y", *acting)
     click_cmd.add_argument("target")
     click_cmd.add_argument("--button", default="left", choices=["left", "right", "middle"])
     click_cmd.add_argument("--double", action="store_true")
@@ -2878,17 +2975,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="resolve against the last observation instead of a fresh one",
     )
 
-    type_cmd = sub.add_parser("type", help="type literal text into the focused surface")
+    type_cmd = command("type", "type literal text into the focused surface", *acting)
     type_cmd.add_argument("text")
     type_cmd.add_argument("--shot")
     type_cmd.add_argument("--settle", type=float, default=0.3)
 
-    key_cmd = sub.add_parser("key", help="press key chords, e.g. ctrl+s Escape F12")
+    key_cmd = command("key", "press key chords, e.g. ctrl+s Escape F12", *acting)
     key_cmd.add_argument("chords", nargs="+")
     key_cmd.add_argument("--shot")
     key_cmd.add_argument("--settle", type=float, default=0.4)
 
-    drag_cmd = sub.add_parser("drag", help="press at one target, release at another")
+    drag_cmd = command("drag", "press at one target, release at another", *acting)
     drag_cmd.add_argument("start")
     drag_cmd.add_argument("end")
     drag_cmd.add_argument("--button", default="left", choices=["left", "right", "middle"])
@@ -2896,24 +2993,26 @@ def build_parser() -> argparse.ArgumentParser:
     drag_cmd.add_argument("--shot")
     drag_cmd.add_argument("--settle", type=float, default=0.4)
 
-    scroll_cmd = sub.add_parser("scroll", help="scroll the pointer's surface")
+    scroll_cmd = command("scroll", "scroll the pointer's surface", *acting)
     scroll_cmd.add_argument("axis", choices=["v", "h", "vertical", "horizontal"])
     scroll_cmd.add_argument("notches", type=float)
     scroll_cmd.add_argument("--at", help="place the pointer at X,Y or a label first")
     scroll_cmd.add_argument("--shot")
     scroll_cmd.add_argument("--settle", type=float, default=0.4)
 
-    shot_cmd = sub.add_parser("shot", help="capture a settled frame")
+    shot_cmd = command("shot", "capture a settled frame", *acting)
     shot_cmd.add_argument("name")
     shot_cmd.add_argument("--scale", type=float, default=1.0)
-    shot_cmd.add_argument("--region", help="LEFT,TOP,RIGHT,BOTTOM in logical pixels")
+    shot_cmd.add_argument(
+        "--region", help="LEFT,TOP,RIGHT,BOTTOM in the framebuffer pixels observe reports"
+    )
 
-    wait_cmd = sub.add_parser("wait", help="wait for text to appear or disappear")
+    wait_cmd = command("wait", "wait for text to appear or disappear", *acting)
     wait_cmd.add_argument("text")
     wait_cmd.add_argument("--gone", action="store_true")
     wait_cmd.add_argument("--timeout", type=float, default=25.0)
 
-    logs_cmd = sub.add_parser("logs", help="tail the application log")
+    logs_cmd = command("logs", "tail the application log", "--session", "--json")
     logs_cmd.add_argument("--lines", type=int, default=40)
 
     return parser
@@ -2924,8 +3023,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        if args.command == "session":
-            return session_command(args)
+        if args.command in SESSION_COMMANDS:
+            return SESSION_COMMANDS[args.command](args)
 
         session = load_session(args.session)
         do_heal = not args.no_heal
@@ -2938,7 +3037,7 @@ def main(argv: list[str] | None = None) -> int:
                 with_text=not args.no_text,
                 prefer=args.observer,
             )
-            print(render(payload, as_json=args.json))
+            emit(payload, describe_observation(payload), as_json=args.json)
             return 0
 
         if args.command == "heal":
@@ -2948,12 +3047,12 @@ def main(argv: list[str] | None = None) -> int:
                 wait_painted(session)
             except HarnessError:
                 painted = False
-            print(
-                render(
-                    {"healed": actions or ["nothing to repair"], "painted": painted},
-                    as_json=args.json,
-                )
+            payload = {"healed": actions or ["nothing to repair"], "painted": painted}
+            text = "\n".join(
+                ["healed: " + "; ".join(actions) if actions else "nothing to repair"]
+                + describe_warnings(payload)
             )
+            emit(payload, text, as_json=args.json)
             return 0
 
         if do_heal:
@@ -2974,7 +3073,7 @@ def main(argv: list[str] | None = None) -> int:
                 shot_name=args.shot,
                 settle=args.settle,
             )
-            print(render(result, as_json=args.json))
+            emit(result, describe_change(result), as_json=args.json)
             return 0
 
         if args.command == "type":
@@ -2985,7 +3084,7 @@ def main(argv: list[str] | None = None) -> int:
                 shot_name=args.shot,
                 settle=args.settle,
             )
-            print(render(result, as_json=args.json))
+            emit(result, describe_change(result), as_json=args.json)
             return 0
 
         if args.command == "key":
@@ -3001,7 +3100,7 @@ def main(argv: list[str] | None = None) -> int:
                 shot_name=args.shot,
                 settle=args.settle,
             )
-            print(render(result, as_json=args.json))
+            emit(result, describe_change(result), as_json=args.json)
             return 0
 
         if args.command == "drag":
@@ -3027,7 +3126,7 @@ def main(argv: list[str] | None = None) -> int:
                 shot_name=args.shot,
                 settle=args.settle,
             )
-            print(render(result, as_json=args.json))
+            emit(result, describe_change(result), as_json=args.json)
             return 0
 
         if args.command == "scroll":
@@ -3044,7 +3143,7 @@ def main(argv: list[str] | None = None) -> int:
                 shot_name=args.shot,
                 settle=args.settle,
             )
-            print(render(result, as_json=args.json))
+            emit(result, describe_change(result), as_json=args.json)
             return 0
 
         if args.command == "shot":
@@ -3065,7 +3164,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 save_frame(image, path)
                 width, height = image.size
-            print(render({"shot": str(path), "size": f"{width}x{height}"}, as_json=args.json))
+            emit(
+                {"shot": str(path), "size": f"{width}x{height}"},
+                f"{path} {width}x{height}",
+                as_json=args.json,
+            )
             return 0
 
         if args.command == "wait":
@@ -3101,15 +3204,12 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 first = False
                 if present != args.gone:
-                    print(
-                        render(
-                            {
-                                "text": args.text,
-                                "state": "gone" if args.gone else "present",
-                                "waited": round(args.timeout - (deadline - time.monotonic()), 2),
-                            },
-                            as_json=args.json,
-                        )
+                    state = "gone" if args.gone else "present"
+                    waited = round(args.timeout - (deadline - time.monotonic()), 2)
+                    emit(
+                        {"text": args.text, "state": state, "waited": waited},
+                        f"{args.text!r} {state} after {waited:g}s",
+                        as_json=args.json,
                     )
                     return 0
                 time.sleep(0.5)
@@ -3125,15 +3225,14 @@ def main(argv: list[str] | None = None) -> int:
                 if log.exists()
                 else []
             )
-            if args.json:
-                # Structured like every other command, because a caller parsing
-                # `--json` should not have to special-case one of them. The
-                # lines stay a list: an application's output is not a field.
-                print(render({"log": str(log), "lines": lines}, as_json=True))
-            elif not log.exists():
-                print("no application log yet")
-            else:
-                print("\n".join(lines))
+            # Structured like every other command, because a caller parsing
+            # `--json` should not have to special-case one of them. The lines
+            # stay a list: an application's output is not a field.
+            emit(
+                {"log": str(log), "lines": lines},
+                "\n".join(lines) if log.exists() else "no application log yet",
+                as_json=args.json,
+            )
             return 0
 
     except HarnessError as error:
@@ -3146,76 +3245,137 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-def session_command(args) -> int:
-    if args.session_command == "start":
-        command = args.cmd.strip()
-        if not command:
-            raise HarnessError("--cmd is empty")
-        overrides: dict[str, str] = {}
-        for entry in args.env:
-            key, _, value = entry.partition("=")
-            if not key:
-                raise HarnessError(f"bad --env {entry!r}; expected K=V")
-            overrides[key] = value
-        width: int | None = None
-        if args.width.strip().lower() != "host":
-            if not args.width.strip().isdigit():
-                raise HarnessError(f"bad --width {args.width!r}; expected pixels or 'host'")
-            width = int(args.width)
-        session = start_session(
-            args.name,
-            command,
-            root=Path(args.root).expanduser().resolve(),
-            portal=args.portal,
-            env_overrides=overrides,
-            timeout=args.timeout,
-            expect_window=not args.no_window_wait,
-            width=width,
-            backend=args.backend,
-            host_bus=args.host_bus,
+def unique_session_name(program: str) -> str:
+    """Name a session after the program it runs, suffixed until no live
+    session holds the name. A dead record may be reused: `start_session`
+    clears it."""
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(program).name).strip("-._") or "app"
+    def live(name: str) -> bool:
+        if not session_file(name).exists():
+            return False
+        try:
+            return load_session(name).alive()
+        except (OSError, ValueError, KeyError):
+            # Truncated or from an older version: `list` treats it as dead too.
+            return False
+
+    name, suffix = base, 1
+    while live(name):
+        suffix += 1
+        name = f"{base}-{suffix}"
+    return name
+
+
+def start_command(args) -> int:
+    argv = list(args.argv)
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
+    if not argv:
+        raise HarnessError(
+            "nothing to start; pass the program and its arguments,"
+            " e.g. `niri-harness start ./my-app --flag`"
         )
-        if args.no_window_wait:
-            print(render({"session": args.name, "started": True}, as_json=args.json))
-            return 0
-        # `observe` heals, waits and reports whether anything was drawn, so a
-        # start needs nothing beyond it.
-        payload = observe(session, window_match=None, do_heal=True, with_text=False)
-        if session.fit:
-            payload["fit"] = session.fit
-        print(render(payload, as_json=args.json))
+    name = args.name or args.session or unique_session_name(argv[0])
+    if not SESSION_NAME.fullmatch(name):
+        raise HarnessError(
+            f"bad session name {name!r}; use letters, digits, '.', '_' and '-'"
+        )
+    overrides: dict[str, str] = {}
+    for entry in args.env:
+        key, _, value = entry.partition("=")
+        if not key:
+            raise HarnessError(f"bad --env {entry!r}; expected K=V")
+        overrides[key] = value
+    width: int | None = None
+    if args.width.strip().lower() != "host":
+        if not args.width.strip().isdigit():
+            raise HarnessError(f"bad --width {args.width!r}; expected pixels or 'host'")
+        width = int(args.width)
+    root = Path(args.root).expanduser().resolve() if args.root else DEFAULT_ROOTS / name
+    # Run where the caller is, so `start ./target/debug/app` means what it
+    # says. The `cd` is part of the command rather than the launcher so that a
+    # directory that has gone away fails the start with its reason in the log.
+    command = f"cd {shell_quote(os.getcwd())} && exec " + " ".join(
+        shell_quote(arg) for arg in argv
+    )
+    session = start_session(
+        name,
+        command,
+        root=root,
+        portal=args.portal,
+        env_overrides=overrides,
+        timeout=args.timeout,
+        expect_window=not args.no_window_wait,
+        width=width,
+        backend=args.backend,
+        host_bus=args.host_bus,
+    )
+    started = f"started {name} in {root}"
+    if args.no_window_wait:
+        emit({"session": name, "root": str(root), "started": True}, started,
+             as_json=args.json)
         return 0
+    # `observe` heals, waits and reports whether anything was drawn, so a
+    # start needs nothing beyond it.
+    payload = observe(session, window_match=None, do_heal=True, with_text=False)
+    payload["root"] = str(root)
+    if session.fit:
+        payload["fit"] = session.fit
+    # Healing a window that has only just mapped is routine, not news. How a
+    # host window was fitted is, because it decides what the coordinates mean;
+    # a headless session is built at the size asked for and says so above.
+    lines = [started, describe_window(payload)]
+    if session.fit and session.backend != "headless":
+        lines.append(f"fit: {session.fit}")
+    lines += describe_warnings(payload)
+    emit(payload, "\n".join(lines), as_json=args.json)
+    return 0
 
-    if args.session_command == "list":
-        rows = [
-            {
-                "name": s.name,
-                "display": s.display,
-                "pid": s.pid,
-                "alive": s.alive(),
-                "backend": s.backend,
-                "root": str(s.root),
-            }
-            for s in list_sessions()
-        ]
-        print(json.dumps(rows, indent=2) if args.json else "\n".join(
-            f"{r['name']:<16} {r['display']:<12} pid={r['pid']:<8} "
-            f"{r['backend']:<9} {'live' if r['alive'] else 'dead'} {r['root']}"
-            for r in rows
-        ) or "no sessions")
-        return 0
 
-    if args.session_command == "stop":
-        session = load_session(args.name or args.session)
-        print(render({"session": session.name, "result": stop_session(session)}, as_json=args.json))
-        return 0
+def list_command(args) -> int:
+    rows = [
+        {
+            "name": s.name,
+            "display": s.display,
+            "pid": s.pid,
+            "alive": s.alive(),
+            "backend": s.backend,
+            "root": str(s.root),
+        }
+        for s in list_sessions()
+    ]
+    text = "\n".join(
+        f"{r['name']:<16} {'live' if r['alive'] else 'dead'} {r['backend']:<9} {r['root']}"
+        for r in rows
+    )
+    emit(rows, text or "no sessions", as_json=args.json)
+    return 0
 
-    if args.session_command == "env":
-        session = load_session(args.name or args.session)
-        for key, value in session.env.items():
-            print(f"export {key}={value}")
-        return 0
 
-    raise HarnessError(f"unknown session command {args.session_command!r}")
+def stop_command(args) -> int:
+    session = load_session(args.name or args.session)
+    result = stop_session(session)
+    emit({"session": session.name, "result": result}, f"{session.name} {result}",
+         as_json=args.json)
+    return 0
+
+
+def env_command(args) -> int:
+    session = load_session(args.name or args.session)
+    variables = dict(session.env)
+    if session.bus:
+        variables["DBUS_SESSION_BUS_ADDRESS"] = session.bus
+    for key, value in variables.items():
+        print(f"export {key}={shell_quote(value)}")
+    return 0
+
+
+SESSION_COMMANDS = {
+    "start": start_command,
+    "list": list_command,
+    "stop": stop_command,
+    "env": env_command,
+}
 
 
 if __name__ == "__main__":
