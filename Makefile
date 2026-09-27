@@ -1,5 +1,10 @@
-PREFIX ?= $(CURDIR)
+PREFIX ?= /usr/local
+DESTDIR ?=
+RUNTIME_DIR := $(DESTDIR)$(PREFIX)/lib/niri-harness
+BIN_DIR := $(DESTDIR)$(PREFIX)/bin
 BUILD  := $(CURDIR)/build
+
+INSTALL ?= install
 
 WAYLAND_CFLAGS := $(shell pkg-config --cflags wayland-client xkbcommon)
 WAYLAND_LIBS   := $(shell pkg-config --libs wayland-client xkbcommon)
@@ -21,9 +26,20 @@ TESSDATA := $(TESSDATA_DIR)/eng.traineddata
 TESSCONFIG := $(TESSDATA_DIR)/configs/tsv
 TESSDATA_URL := https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata
 
-.PHONY: all clean check
+.PHONY: all install clean check
 
 all: $(BUILD)/vptr $(BUILD)/vkbd $(TESSDATA) $(TESSCONFIG)
+
+install: all
+	$(INSTALL) -Dm755 bin/niri-harness $(RUNTIME_DIR)/bin/niri-harness
+	$(INSTALL) -Dm755 $(BUILD)/vptr $(RUNTIME_DIR)/build/vptr
+	$(INSTALL) -Dm755 $(BUILD)/vkbd $(RUNTIME_DIR)/build/vkbd
+	$(INSTALL) -Dm644 share/nested.kdl $(RUNTIME_DIR)/share/nested.kdl
+	$(INSTALL) -Dm755 share/a11y_probe.py $(RUNTIME_DIR)/share/a11y_probe.py
+	$(INSTALL) -Dm644 $(TESSDATA) $(RUNTIME_DIR)/share/tessdata/eng.traineddata
+	$(INSTALL) -Dm644 $(TESSCONFIG) $(RUNTIME_DIR)/share/tessdata/configs/tsv
+	$(INSTALL) -d $(BIN_DIR)
+	ln -sfn ../lib/niri-harness/bin/niri-harness $(BIN_DIR)/niri-harness
 
 $(TESSDATA):
 	@mkdir -p $(dir $@)
