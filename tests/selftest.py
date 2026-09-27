@@ -303,6 +303,11 @@ def test_a_command_that_cannot_start_fails_immediately() -> None:
             message = str(error)
             check("status reported", "status 127" in message, message)
             check("cause quoted from the log", "No such file or directory" in message, message)
+            # The session's bus daemon and the services it activates are
+            # talkative, and in the application's log they pushed the line
+            # above out of the tail that is quoted.
+            check("the log quoted is the application's alone",
+                  "dbus-daemon" not in message, message)
         # A failed start must not leave a registered session behind: the nested
         # compositor is perfectly healthy, so `alive()` would keep saying yes.
         check(

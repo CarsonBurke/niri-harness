@@ -135,6 +135,24 @@ def log_tail(log: Path, lines: int) -> str:
     return "\n".join(text[-lines:]) or "(empty)"
 
 
+def application_output(root: Path, lines: int = 15) -> str:
+    """What the application said, for an error about it.
+
+    Its own log first. When that is empty the application may never have run:
+    the private bus wraps it, and anything that failed before handing over -
+    the bus daemon, the shell that records its address - wrote to the bus log.
+    """
+    log = root / "session.log"
+    tail = log_tail(log, lines)
+    if tail not in ("(no output)", "(empty)"):
+        return f"Last output from {log}:\n{tail}"
+    bus_log = root / "bus.log"
+    bus_tail = log_tail(bus_log, lines)
+    if bus_tail not in ("(no output)", "(empty)"):
+        return f"{log} is empty; last output from {bus_log}:\n{bus_tail}"
+    return f"{log} is empty."
+
+
 def await_application(session: Session, status: Path, deadline: float) -> None:
     """Wait for the application to map a window, or to die trying.
 
@@ -146,23 +164,20 @@ def await_application(session: Session, status: Path, deadline: float) -> None:
         if status.exists():
             code = status.read_text(errors="replace").strip() or "?"
             raise HarnessError(
-                f"the application exited with status {code} without mapping a window."
-                f" Last output from {session.root / 'session.log'}:\n"
-                f"{log_tail(session.root / 'session.log', 15)}"
+                f"the application exited with status {code} without mapping a window. "
+                f"{application_output(session.root)}"
             )
         if windows(session):
             return
         if not session.alive():
             raise HarnessError(
-                f"the nested compositor died while starting the application."
-                f" Last output from {session.root / 'session.log'}:\n"
-                f"{log_tail(session.root / 'session.log', 15)}"
+                f"the nested compositor died while starting the application. "
+                f"{application_output(session.root)}"
             )
         if time.monotonic() > deadline:
             raise HarnessError(
-                f"the application mapped no window before the timeout."
-                f" Last output from {session.root / 'session.log'}:\n"
-                f"{log_tail(session.root / 'session.log', 15)}"
+                f"the application mapped no window before the timeout. "
+                f"{application_output(session.root)}"
             )
         time.sleep(0.15)
 
@@ -345,6 +360,7 @@ def dead_session_report(known: list["Session"]) -> str:
             ("application status", session.root / "session.rc", 1),
             ("compositor", session.root / "compositor.log", 3),
             ("application", session.root / "session.log", 3),
+            ("bus", session.root / "bus.log", 2),
         ):
             try:
                 tail = path.read_text(errors="replace").splitlines()[-keep:]
@@ -490,13 +506,23 @@ def private_bus(command: str, root: Path) -> str:
     # back the same way the Wayland socket is: written to a file the caller
     # reads. Without it nothing outside could ever reach this session's
     # accessibility tree.
+    #
+    # The bus daemon and every service it activates - portals, keyrings,
+    # notification daemons - write to whatever output the daemon was given,
+    # and they are talkative. Left in the application's log they bury its own
+    # output, including the one line that says why it failed to start, so
+    # they get a log of their own and only the application writes to its log.
     inner = (
         f'printf "DBUS_SESSION_BUS_ADDRESS=%s\\n" "$DBUS_SESSION_BUS_ADDRESS" '
         f"> {shell_quote(str(root / 'session.bus'))}\n"
         f"{a11y_preamble(root)}"
+        f"exec >>{shell_quote(str(root / 'session.log'))} 2>&1\n"
         f"{command}\n"
     )
-    return f"exec dbus-run-session -- /bin/sh -c {shell_quote(inner)}"
+    return (
+        f"exec dbus-run-session -- /bin/sh -c {shell_quote(inner)}"
+        f" >>{shell_quote(str(root / 'bus.log'))} 2>&1"
+    )
 
 
 def configure_portal(
