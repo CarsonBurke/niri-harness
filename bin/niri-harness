@@ -34,6 +34,7 @@ import signal
 import subprocess
 import sys
 import time
+from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +43,7 @@ BUILD_DIR = HARNESS_ROOT / "build"
 VPTR = BUILD_DIR / "vptr"
 VKBD = BUILD_DIR / "vkbd"
 NESTED_CONFIG = HARNESS_ROOT / "share" / "nested.kdl"
+A11Y_PROBE = HARNESS_ROOT / "share" / "a11y_probe.py"
 TESSDATA = HARNESS_ROOT / "share" / "tessdata"
 
 STATE_DIR = Path(
@@ -57,6 +59,16 @@ PAINTED_MIN_VARIETY = 0.02
 # Two frames this close are treated as the same settled frame. Screenshots of
 # an idle window still differ by a few pixels: a blinking caret, a clock.
 STABLE_MAX_DIFF_FRACTION = 0.002
+
+# Settling and change detection sample a strided grid rather than every pixel,
+# so they never needed a smaller frame - and asking grim for one is a net loss.
+# Any `-s` makes grim scale the frame itself, which costs a flat ~80 ms here,
+# while comparing a full frame instead of a tenth-scale one costs ~8 ms:
+#
+#   grim -t ppm            32 ms      frame_difference, full frame   9.1 ms
+#   grim -t ppm -s 0.1    114 ms      frame_difference, 0.1 probe    0.6 ms
+#
+# so a probe is simply a capture.
 
 
 class HarnessError(RuntimeError):
@@ -233,12 +245,39 @@ class Session:
     socket: str
     pid: int
     root: Path
+    # "headless" when the compositor draws into its own X server, "window" when
+    # it draws into a window on the host. Only the latter can be throttled.
+    backend: str = "window"
+    # The private X server backing a headless session, so stopping the session
+    # can reap it. The compositor is not its child and will not take it down.
+    x_display: str | None = None
+    xvfb_pid: int | None = None
+    # When those two pids were issued, from /proc/PID/stat. A pid alone names
+    # nothing once its process has gone: the number is reissued from the start
+    # and the record outlives the session. A pid and the moment it began are
+    # unique for the life of the boot, so they settle it.
+    pid_start: int | None = None
+    xvfb_start: int | None = None
+    # Which boot the pid above was issued by. A record that outlives a reboot
+    # refers to a numbering that no longer exists, and pids get reissued from
+    # the start, so it must never be acted on.
+    boot: str | None = None
     # What sizing the nested output ended up with, for the start report only.
     fit: str | None = None
 
     @property
     def env(self) -> dict[str, str]:
         return {"WAYLAND_DISPLAY": self.display, "NIRI_SOCKET": self.socket}
+
+    @property
+    def bus(self) -> str | None:
+        """The session's own D-Bus address, once the session has reported it."""
+        try:
+            text = (self.root / "session.bus").read_text()
+        except OSError:
+            return None
+        match = re.search(r"DBUS_SESSION_BUS_ADDRESS=(\S+)", text)
+        return match.group(1) if match else None
 
     @property
     def shots(self) -> Path:
@@ -275,17 +314,56 @@ def save_session(session: Session) -> None:
                 "socket": session.socket,
                 "pid": session.pid,
                 "root": str(session.root),
+                "backend": session.backend,
+                "x_display": session.x_display,
+                "xvfb_pid": session.xvfb_pid,
+                "pid_start": session.pid_start,
+                "xvfb_start": session.xvfb_start,
+                "boot": session.boot,
             },
             indent=2,
         )
     )
 
+def dead_session_report(known: list["Session"]) -> str:
+    """Say why there is no session, not merely that there is none.
+
+    A session that was alive a moment ago and is not now is the most expensive
+    thing that can happen mid-run: every later command fails, and "no live
+    session" points at the operator's setup rather than at the compositor or
+    the application that actually went away. The records survive the processes,
+    so the last words of both are still readable - and they are what says
+    whether the application exited, the nested compositor did, or the host
+    closed the window under it.
+    """
+    if not known:
+        return "no live session; start one with `session start`"
+    lines = ["no live session; the most recent one has died"]
+    for session in known[-2:]:
+        lines.append(f"session {session.name} pid={session.pid} root={session.root}")
+        for label, path, keep in (
+            ("application status", session.root / "session.rc", 1),
+            ("compositor", session.root / "compositor.log", 3),
+            ("application", session.root / "session.log", 3),
+        ):
+            try:
+                tail = path.read_text(errors="replace").splitlines()[-keep:]
+            except OSError:
+                continue
+            for line in tail:
+                if line.strip():
+                    lines.append(f"  {label}: {line.strip()}")
+    lines.append("restart with `session start`")
+    return "\n".join(lines)
+
+
 
 def load_session(name: str | None) -> Session:
     if name is None:
-        live = [s for s in list_sessions() if s.alive()]
+        known = list_sessions()
+        live = [s for s in known if s.alive()]
         if not live:
-            raise HarnessError("no live session; start one with `session start`")
+            raise HarnessError(dead_session_report(known))
         if len(live) > 1:
             names = ", ".join(s.name for s in live)
             raise HarnessError(f"several live sessions ({names}); pass --session")
@@ -293,13 +371,24 @@ def load_session(name: str | None) -> Session:
     path = session_file(name)
     if not path.exists():
         raise HarnessError(f"unknown session {name!r}")
-    data = json.loads(path.read_text())
+    return session_from_record(json.loads(path.read_text()))
+
+
+def session_from_record(data: dict) -> Session:
+    """Rebuild a session from its record, tolerating one written by an older
+    version that predates the headless backend."""
     return Session(
         name=data["name"],
         display=data["display"],
         socket=data["socket"],
         pid=int(data["pid"]),
         root=Path(data["root"]),
+        backend=data.get("backend") or "window",
+        x_display=data.get("x_display"),
+        xvfb_pid=data.get("xvfb_pid"),
+        pid_start=data.get("pid_start"),
+        xvfb_start=data.get("xvfb_start"),
+        boot=data.get("boot"),
     )
 
 
@@ -309,16 +398,7 @@ def list_sessions() -> list[Session]:
     sessions = []
     for path in sorted(STATE_DIR.glob("*.json")):
         try:
-            data = json.loads(path.read_text())
-            sessions.append(
-                Session(
-                    name=data["name"],
-                    display=data["display"],
-                    socket=data["socket"],
-                    pid=int(data["pid"]),
-                    root=Path(data["root"]),
-                )
-            )
+            sessions.append(session_from_record(json.loads(path.read_text())))
         except (OSError, ValueError, KeyError):
             continue
     return sessions
@@ -337,22 +417,102 @@ PORTAL_BACKENDS = {
 }
 
 
+# Where distributions put the accessibility bus launcher and its registry. Both
+# are needed: the launcher alone leaves the registry to D-Bus activation, which
+# on this kind of session tries systemd, finds the host's unit and fails with
+# "Could not activate remote peer 'org.a11y.atspi.Registry'".
+A11Y_PROGRAMS = ("at-spi-bus-launcher", "at-spi2-registryd")
+A11Y_SEARCH = ("/usr/lib", "/usr/libexec", "/usr/lib64", "/usr/lib/at-spi2-core")
+
+
+def find_a11y_programs() -> dict[str, str] | None:
+    """Locate the accessibility bus programs, or say they are not installed."""
+    found: dict[str, str] = {}
+    for program in A11Y_PROGRAMS:
+        path = shutil.which(program)
+        if not path:
+            for directory in A11Y_SEARCH:
+                candidate = Path(directory) / program
+                if candidate.exists():
+                    path = str(candidate)
+                    break
+        if not path:
+            return None
+        found[program] = path
+    return found
+
+
+def a11y_preamble(root: Path) -> str:
+    """Shell that gives the session an accessibility bus of its very own.
+
+    Reading an application's own widget tree is both far cheaper and far more
+    truthful than reading its pixels - names, roles and enabled/disabled state
+    are simply there, where OCR can only guess at them from glyphs - and it
+    keeps working while the compositor is not painting, because it never goes
+    near a frame.
+
+    The bus has to be started here, inside the session's own D-Bus session,
+    rather than left to activation: activation would reach the caller's bus and
+    put this session's widgets on the same registry as their own applications.
+    """
+    programs = find_a11y_programs()
+    if not programs:
+        return ""
+    launcher = shell_quote(programs["at-spi-bus-launcher"])
+    registry = shell_quote(programs["at-spi2-registryd"])
+    log = shell_quote(str(root / "a11y.log"))
+    return (
+        f"{launcher} --launch-immediately >>{log} 2>&1 &\n"
+        "sleep 0.5\n"
+        f"{registry} >>{log} 2>&1 &\n"
+        # Toolkits consult these before they will talk to the bus at all.
+        "export GTK_A11Y=atspi QT_ACCESSIBILITY=1 QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1\n"
+        "export GNOME_ACCESSIBILITY=1\n"
+        "unset NO_AT_BRIDGE\n"
+    )
+
+
+def private_bus(command: str, root: Path) -> str:
+    """Run the application on a session bus of its own.
+
+    Without this the nested session inherits DBUS_SESSION_BUS_ADDRESS verbatim,
+    so it is only isolated in the things that travel over Wayland. Everything
+    that travels over D-Bus still reaches the host desktop, and single-instance
+    activation is the case that bites: `gnome-text-editor` started in a session
+    finds the caller's own copy already owning its name on the host bus, hands
+    the request to it, opens a tab on the caller's desktop and exits 0 - which
+    arrives here as "the application exited without mapping a window". Sessions
+    are supposed to be startable while someone works; a window appearing on
+    their desktop is the one outcome this tool must never produce.
+    """
+    require_tool("dbus-run-session")
+    # The bus address is discovered inside the new session, so it is handed
+    # back the same way the Wayland socket is: written to a file the caller
+    # reads. Without it nothing outside could ever reach this session's
+    # accessibility tree.
+    inner = (
+        f'printf "DBUS_SESSION_BUS_ADDRESS=%s\\n" "$DBUS_SESSION_BUS_ADDRESS" '
+        f"> {shell_quote(str(root / 'session.bus'))}\n"
+        f"{a11y_preamble(root)}"
+        f"{command}\n"
+    )
+    return f"exec dbus-run-session -- /bin/sh -c {shell_quote(inner)}"
+
+
 def configure_portal(
-    backend: str, root: Path, env_overrides: dict[str, str], command: str
-) -> str:
-    """Give the session its own portal, drawing inside the nested compositor.
+    backend: str, root: Path, env_overrides: dict[str, str]
+) -> None:
+    """Draw portal dialogs inside the nested session rather than on the host.
 
     A file chooser reached through xdg-desktop-portal is drawn by a backend
-    process, not by the application. On the host's session bus that backend is
-    already running and connected to the host compositor, so the dialog appears
-    on the host desktop, outside the isolation the session exists to provide.
-    Running the application on its own bus makes the backend activate fresh and
-    inherit the nested display, so the dialog is part of the session under test.
+    process, not by the application. The session already has a bus of its own,
+    so the backend activates fresh and inherits the nested display; what is
+    left is telling it which implementation to be, because the default depends
+    on the desktop name and picks one that cannot draw here.
     """
     if backend not in PORTAL_BACKENDS:
         known = ", ".join(sorted(PORTAL_BACKENDS))
         raise HarnessError(f"unknown portal backend {backend!r}; known: {known}")
-    require_tool("dbus-run-session")
 
     config_home = Path(
         env_overrides.get("XDG_CONFIG_HOME") or (root / "xdg-config")
@@ -369,7 +529,176 @@ def configure_portal(
     )
     # A backend still consults the desktop name to decide it is wanted at all.
     env_overrides.setdefault("XDG_CURRENT_DESKTOP", "gnome")
-    return f"exec dbus-run-session -- /bin/sh -c {shell_quote(command)}"
+
+
+# --------------------------------------------------------------------------
+# the headless backend
+
+
+# niri's winit backend opens a window of this fixed size and ignores an
+# `output ... { mode }` for it, so the framebuffer cannot be asked for directly.
+# It is, however, exactly the window size multiplied by winit's scale factor,
+# and that one *is* settable - which buys an exact framebuffer of any width.
+WINIT_WINDOW = (1280, 800)
+
+
+# The widths a session may be asked for, so a request outside them is refused
+# in the caller's own units rather than silently clamped into a size nobody
+# asked for. This is policy and not a limit of the backend: winit takes scale
+# factors well outside it and niri lays out against them correctly - measured
+# at 0.2 and at 12, giving 256 and 15360 logical pixels. What the range says is
+# that a quarter of the window and six times it bracket every viewport a
+# desktop application is worth testing against, and that a width far outside
+# them is much more likely to be a typo than an intention.
+HEADLESS_WIDTH_RANGE = (
+    round(WINIT_WINDOW[0] * 0.25),
+    round(WINIT_WINDOW[0] * 6.0),
+)
+
+
+def headless_scale(width: int) -> float:
+    """The winit scale factor that yields a framebuffer `width` pixels wide."""
+    return round(width / WINIT_WINDOW[0], 4)
+
+
+def start_xvfb(root: Path, framebuffer: tuple[int, int]) -> tuple[subprocess.Popen, str]:
+    """Start a private X server for one session, and say which display it took.
+
+    `-displayfd` makes the X server choose a free display number and report it,
+    which is the only race-free way to do this: probing /tmp/.X11-unix and then
+    claiming what looked free loses to any other session starting at the same
+    moment, and the loser fails with an error about a display already in use.
+    """
+    require_tool("Xvfb")
+    read_fd, write_fd = os.pipe()
+    log = (root / "xvfb.log").open("ab")
+    try:
+        proc = subprocess.Popen(
+            [
+                "Xvfb", "-displayfd", str(write_fd),
+                # The screen only has to contain the compositor's window; it is
+                # never captured, because `grim` reads the nested Wayland output.
+                "-screen", "0", f"{framebuffer[0]}x{framebuffer[1]}x24",
+                "-nolisten", "tcp",
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            pass_fds=(write_fd,),
+            start_new_session=True,
+        )
+    except BaseException:
+        # The read end is adopted by the reader below and closed there; if the
+        # server never started there is no reader, and it would leak.
+        os.close(read_fd)
+        raise
+    finally:
+        os.close(write_fd)
+        log.close()
+
+    number = b""
+    deadline = time.monotonic() + 20.0
+    with os.fdopen(read_fd, "rb") as pipe:
+        os.set_blocking(pipe.fileno(), False)
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise HarnessError(
+                    f"Xvfb exited with {proc.returncode} before naming a display; "
+                    f"see {root / 'xvfb.log'}:\n{log_tail(root / 'xvfb.log', 10)}"
+                )
+            try:
+                chunk = pipe.read()
+            except BlockingIOError:
+                chunk = None
+            if chunk:
+                number += chunk
+                if number.strip().isdigit() and number.endswith(b"\n"):
+                    break
+            time.sleep(0.05)
+    if not number.strip().isdigit():
+        # Waited for, not merely signalled: an X server left running holds its
+        # display number for the rest of the login session, and the harness is
+        # about to report that it could not get one.
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        raise HarnessError("Xvfb did not report a display number within 20s")
+    return proc, f":{number.strip().decode()}"
+
+
+def reaped(pid: int) -> bool:
+    """Whether a process is really gone, zombies included.
+
+    A child that was signalled but never waited for stays in the process table
+    as a zombie, and a zombie answers signal 0 exactly as a live process does -
+    so the obvious liveness check says the X server is still running forever.
+    Waiting for it is also the only way to stop leaving one behind per session
+    in a caller that outlives several, which a test run is.
+    """
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass  # Not ours to reap; whether it is alive is still worth asking.
+    except OSError:
+        return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    try:
+        state = (Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1]).split()[0]
+    except (OSError, IndexError):
+        return True
+    return state == "Z"
+
+
+def stop_xvfb(session: Session) -> None:
+    """Reap the session's X server, and only ever that.
+
+    A recorded pid carries no evidence of what it names: a record left behind
+    by a crash, or one that outlived a reboot, may point at whatever has since
+    been given the number. The X server is not in the session's process group -
+    it is started before the compositor and has to outlive it - so it cannot
+    borrow the group's attribution and must identify itself.
+
+    Its command line cannot do that: `Xvfb -displayfd 4 -screen 0 1600x1000x24`
+    names no session, so it proves only that the pid is *an* X server, and the
+    likeliest stranger on a machine running this tool is another one of these.
+    When it began does settle it, so that is what is recorded and compared. A
+    record too old to carry it is left alone rather than guessed at: leaking an
+    X server costs a display number until logout, and guessing wrong takes down
+    somebody else's session.
+    """
+    pid = session.xvfb_pid
+    if not pid:
+        return
+    if session.boot is not None and session.boot != boot_id():
+        return
+    if not is_recorded_process(pid, session.xvfb_start):
+        if session.xvfb_start is None and process_cmdline(pid) is not None:
+            # A record written before the start time was kept - an upgrade
+            # while this session was running, and nothing else. Say so rather
+            # than leak in silence: the display number is held until logout,
+            # and `kill` is one command away for somebody who can see it.
+            print(
+                f"warning: session {session.name!r} predates this version and"
+                f" cannot vouch for its X server; leaving pid {pid} alone",
+                file=sys.stderr,
+            )
+        return
+    # A zombie answers `process_start` as readily as a live process, and still
+    # needs collecting - which is the whole reason `reaped` exists.
+    for signal_number in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, signal_number)
+        except OSError:
+            return
+        for _ in range(40):
+            if reaped(pid):
+                return
+            time.sleep(0.05)
 
 
 def start_session(
@@ -382,9 +711,22 @@ def start_session(
     timeout: float,
     expect_window: bool = True,
     width: int | None = 1600,
+    backend: str = "headless",
+    host_bus: bool = False,
 ) -> Session:
     ensure_built()
     require_tool("niri")
+    if backend not in ("headless", "window"):
+        raise HarnessError(f"unknown backend {backend!r}; known: headless, window")
+    if portal and host_bus:
+        # The portal is reached over D-Bus, so on the caller's bus it is the
+        # caller's portal that answers, and the file chooser opens on their
+        # desktop - the one thing `--portal` exists to prevent.
+        raise HarnessError(
+            "--portal cannot be combined with --host-bus: a file chooser"
+            " requested on your own bus opens on your own desktop, which is"
+            " what --portal is for keeping inside the session"
+        )
     existing = session_file(name)
     if existing.exists():
         previous = load_session(name)
@@ -399,11 +741,13 @@ def start_session(
     handshake.unlink(missing_ok=True)
     status = root / "session.rc"
     status.unlink(missing_ok=True)
+    (root / "session.bus").unlink(missing_ok=True)
     log = root / "session.log"
 
     if portal:
-        command = configure_portal(portal, root, env_overrides, command)
-
+        configure_portal(portal, root, env_overrides)
+    if not host_bus:
+        command = private_bus(command, root)
 
     # The child records the nested environment it inherited. Discovering it any
     # other way means scanning for sockets, which races other nested sessions.
@@ -414,6 +758,10 @@ def start_session(
     launcher.write_text(
         "#!/bin/sh\n"
         "# Written by niri-harness. Runs inside the nested compositor.\n"
+        # This sizes the compositor's own winit window under the headless
+        # backend. Left set, it would be inherited by any winit application in
+        # the session and scale that too.
+        "unset WINIT_X11_SCALE_FACTOR\n"
         f"printf 'WAYLAND_DISPLAY=%s\\nNIRI_SOCKET=%s\\n' "
         f'"$WAYLAND_DISPLAY" "$NIRI_SOCKET" > {shell_quote(str(handshake))}\n'
         f"{exports}\n"
@@ -433,16 +781,72 @@ def start_session(
     session_config.write_text(NESTED_CONFIG.read_text())
     run(["niri", "validate", "-c", str(session_config)], timeout=20)
 
-    # Recorded before the window exists, so it names the caller's own window.
-    previous_focus = host_focused_window()
+    # Only a window backend maps anything on the host, and the host focuses
+    # what it maps. A headless session has no window and nothing to give back.
+    previous_focus = host_focused_window() if backend == "window" else None
 
-    proc = subprocess.Popen(
-        ["niri", "-c", str(session_config), "--", str(launcher)],
-        env=dict(os.environ),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    niri_env = dict(os.environ)
+    xvfb: subprocess.Popen | None = None
+    x_display: str | None = None
+    if backend == "headless":
+        low, high = HEADLESS_WIDTH_RANGE
+        if width is not None and not low <= width <= high:
+            raise HarnessError(
+                f"--width {width} is outside the {low}-{high} a session may be"
+                f" asked for. The backend would produce it; the range is there"
+                f" because a width this far outside the useful ones is far more"
+                f" likely to be a mistake than an intention"
+            )
+        scale = headless_scale(width) if width else 1.0
+        framebuffer = (
+            round(WINIT_WINDOW[0] * scale),
+            round(WINIT_WINDOW[1] * scale),
+        )
+        xvfb, x_display = start_xvfb(root, framebuffer)
+        # niri chooses its winit backend from the environment: a Wayland
+        # display if it is given one, an X display otherwise. It must find
+        # ours and not the caller's, or the session draws on their desktop.
+        niri_env.pop("WAYLAND_DISPLAY", None)
+        niri_env.pop("NIRI_SOCKET", None)
+        niri_env["DISPLAY"] = x_display
+        niri_env["WINIT_X11_SCALE_FACTOR"] = str(scale)
+
+    # The nested compositor's own output goes to a file, not to DEVNULL: when it
+    # dies mid-run the application only reports "Connection reset by peer", and
+    # without this log there is nothing left to say why the compositor went away.
+    compositor_log = root / "compositor.log"
+    boot = boot_id()
+    xvfb_start = process_start(xvfb.pid) if xvfb else None
+    with compositor_log.open("ab") as sink:
+        proc = subprocess.Popen(
+            ["niri", "-c", str(session_config), "--", str(launcher)],
+            env=niri_env,
+            stdout=sink,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid_start = process_start(proc.pid)
+
+    def abandon(message: str) -> HarnessError:
+        """Take the whole session down before reporting why it did not start.
+
+        The X server is not the compositor's child, so nothing else will reap
+        it, and a leaked one holds its display number for the life of the login
+        session.
+        """
+        sweep_process_group(proc.pid, root, boot, pid_start)
+        if xvfb is not None and xvfb.poll() is None:
+            # This one is the harness's own child and needs no attributing,
+            # but it does need a second signal: an X server that ignores the
+            # first would hold its display number for the life of the login.
+            xvfb.terminate()
+            try:
+                xvfb.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                xvfb.kill()
+                xvfb.wait(timeout=2.0)
+        return HarnessError(message)
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if handshake.exists():
@@ -456,6 +860,12 @@ def start_session(
                     socket=socket.group(1),
                     pid=proc.pid,
                     root=root,
+                    backend=backend,
+                    x_display=x_display,
+                    xvfb_pid=xvfb.pid if xvfb else None,
+                    pid_start=pid_start,
+                    xvfb_start=xvfb_start,
+                    boot=boot,
                 )
                 save_session(session)
                 # The handshake proves the compositor is up, not the
@@ -470,21 +880,54 @@ def start_session(
                     except HarnessError as error:
                         stop_session(session)
                         raise HarnessError(str(error)) from None
-                    if width is not None:
-                        session.fit = fit_nested_viewport(session, width)
-                    # The host focuses a newly mapped window, and this one is
-                    # the harness's, not the caller's. Give it back.
-                    returned = restore_host_focus(previous_focus)
-                    if returned:
-                        session.fit = f"{session.fit + '; ' if session.fit else ''}{returned}"
+                    session.fit = describe_viewport(session, width)
+                # The host focuses a newly mapped window, and this one is the
+                # harness's, not the caller's. Give it back - and do it whether
+                # or not the application was waited for, because the window
+                # that took the focus is the compositor's own.
+                returned = restore_host_focus(previous_focus)
+                if returned:
+                    session.fit = f"{session.fit + '; ' if session.fit else ''}{returned}"
                 return session
         if proc.poll() is not None:
-            raise HarnessError(
-                f"nested niri exited with {proc.returncode} before handshake; see {log}"
+            raise abandon(
+                f"nested niri exited with {proc.returncode} before handshake; "
+                f"see {compositor_log}:\n{log_tail(compositor_log, 15)}"
+            )
+        if xvfb is not None and xvfb.poll() is not None:
+            raise abandon(
+                f"the session's X server exited with {xvfb.returncode}; "
+                f"see {root / 'xvfb.log'}:\n{log_tail(root / 'xvfb.log', 10)}"
             )
         time.sleep(0.1)
-    proc.terminate()
-    raise HarnessError(f"nested niri did not hand back its environment within {timeout:g}s")
+    raise abandon(f"nested niri did not hand back its environment within {timeout:g}s")
+
+
+def describe_viewport(session: Session, width: int | None) -> str | None:
+    """Say what the application is laying out against, and how it was obtained.
+
+    A headless session is sized before the compositor starts, by the winit
+    scale factor, so the framebuffer is exactly what was asked for and the
+    output scale stays 1 - meaning framebuffer pixels and pointer coordinates
+    are the same numbers. A window session cannot do that, because the host
+    decides the shape of the window it draws into, so it still trades scale for
+    logical width after the fact.
+    """
+    if session.backend != "headless":
+        return fit_nested_viewport(session, width) if width is not None else None
+    try:
+        logical_w, logical_h, _ = output_geometry(session)
+    except HarnessError:
+        return "nested output reported no geometry"
+    # Reported even when no width was asked for. There is no host window to
+    # have accepted a size from, so `--width host` means the compositor's own
+    # default rather than nothing, and saying nothing would leave the one
+    # backend that can size itself exactly as the one that never says what to.
+    asked = "" if width is not None else ", the compositor's own default"
+    return (
+        f"viewport {logical_w}x{logical_h} at scale 1"
+        f" (headless; no host window{asked})"
+    )
 
 
 def shell_quote(value: str) -> str:
@@ -493,31 +936,263 @@ def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
-def stop_session(session: Session, *, timeout: float = 10.0) -> str:
-    if not session.alive():
-        session_file(session.name).unlink(missing_ok=True)
-        return "already stopped"
-    session.niri("action", "quit", "--skip-confirmation", check=False, timeout=5)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not session.alive():
-            session_file(session.name).unlink(missing_ok=True)
-            return "stopped"
-        time.sleep(0.1)
-    # The compositor owns every client in the session, so terminating its
-    # process group is the bounded fallback rather than hunting for children.
+ACCESSIBILITY_STRAYS = ("at-spi2-registryd", "at-spi-bus-launcher")
+
+
+def boot_id() -> str | None:
+    """This boot's identifier, which changes every time the machine restarts."""
     try:
-        os.killpg(os.getpgid(session.pid), signal.SIGTERM)
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
     except OSError:
-        pass
-    time.sleep(0.5)
-    if session.alive():
+        return None
+
+
+def process_cmdline(pid: int) -> str | None:
+    """A process's command line, or None if there is no such process.
+
+    An empty string is a real answer and not the same as None: a zombie has
+    been stripped of its arguments but is still in the process table.
+    """
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return None
+
+
+def process_group(pgid: int) -> list[int]:
+    """Every process currently in a process group."""
+    members = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
         try:
-            os.killpg(os.getpgid(session.pid), signal.SIGKILL)
+            stat = (entry / "stat").read_text()
         except OSError:
-            pass
-    session_file(session.name).unlink(missing_ok=True)
-    return "killed"
+            continue  # It exited while we were looking at it.
+        try:
+            if int(stat.rsplit(")", 1)[1].split()[2]) == pgid:
+                members.append(int(entry.name))
+        except (IndexError, ValueError):
+            continue
+    return members
+
+
+def process_start(pid: int) -> int | None:
+    """When `pid` began, in clock ticks since boot, or None if it is gone.
+
+    This is what makes a recorded pid mean something. The number on its own is
+    reissued from the start and a record outlives the session it describes, so
+    the pair (pid, started-at) is the identity that has to match - and a zombie
+    still answers, which matters because that is the state a compositor whose
+    session has just been torn down is most often found in.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # The second field is the executable name in parentheses and may itself
+    # contain spaces and parentheses, so the fields are counted from the last
+    # `)` rather than split from the left.
+    try:
+        return int(stat[stat.rindex(")") + 2 :].split()[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def is_recorded_process(pid: int, start: int | None) -> bool:
+    """Whether `pid` is still the very process the record was written about."""
+    return start is not None and process_start(pid) == start
+
+
+def names_root(cmdline: str, root: Path) -> bool:
+    """Whether a command line refers to this session's directory.
+
+    A plain substring test is not enough: session roots are sibling
+    directories with a name the caller chose, so `.../run` occurs inside
+    `.../run2` and would claim a neighbouring session's processes as its own.
+    The path has to end where it is found - at a separator, at whitespace, at
+    a quote, at the end of the argument - which is why this is not simply a
+    comparison against each argument in turn: the launch preamble carries the
+    root inside a single `sh -c` argument, several times over, alongside other
+    paths.
+    """
+    for path in {str(root), str(root.resolve())}:
+        for found in re.finditer(re.escape(path), cmdline):
+            tail = cmdline[found.end() : found.end() + 1]
+            if not tail or not (tail.isalnum() or tail in "-_."):
+                return True
+    return False
+
+
+def leader_is_ours(pid: int, root: Path) -> bool:
+    """Whether the live process `pid` is this session's own compositor.
+
+    Its command line names the session's configuration, which nothing else on
+    the machine does. A process that has none - it is gone, or it is a zombie
+    stripped of its arguments - cannot corroborate anything, and saying yes
+    there is how a stranger's whole process group gets signalled: a zombie
+    proves its pid is pinned *now*, not that it was pinned when the number was
+    handed out. The caller falls back to attributing one member at a time.
+    """
+    cmdline = process_cmdline(pid)
+    if not cmdline:
+        return False
+    return names_root(cmdline, root)
+
+
+def sweep_process_group(
+    pid: int, root: Path, boot: str | None, start: int | None = None
+) -> None:
+    """Take down anything the session left behind, and nothing else.
+
+    Quitting the compositor is not enough on its own. The accessibility bus is
+    started alongside the application rather than by it, so it is not the
+    compositor's child; measured against a compositor killed outright, it is
+    the one thing in the session that survives, reparented to the user's
+    service manager and still holding a socket in the runtime directory.
+
+    Attribution is the whole difficulty, because a record outlives the session
+    it describes. Three cases, and they need different evidence:
+
+    When the record says when the leader began and the process still says the
+    same, it is beyond doubt the one the record was written about, zombie or
+    not, and every process in its group is by construction something this
+    harness started - `start_new_session` made it the group leader - so the
+    group can be signalled wholesale. A record from before that was written
+    down falls back to the leader's command line, which names this session's
+    configuration and so is corroboration of the same kind, only weaker. A
+    start time that is there and does not match is the one case that ends the
+    sweep outright: the number now belongs to a stranger, and it cannot still
+    name this group as well, because the kernel holds a pid back for as long
+    as it names a group with members in it.
+
+    Once it is gone, group membership proves nothing. The kernel holds a pid
+    back only while it still names a live group, so an emptied group's number
+    is free, and anything may since have claimed it. Each survivor therefore
+    has to name itself: either its command line refers to this session, or it
+    is one of the accessibility programs the preamble starts, which is what
+    actually survives. A record from an earlier boot describes a numbering that
+    no longer exists and is never acted on at all.
+    """
+    if pid <= 1:
+        # `killpg(0, ...)` signals the caller's own process group, and pid 1 is
+        # the service manager's. Neither can have come from a real session.
+        return
+    if boot is not None and boot != boot_id():
+        return
+    began = process_start(pid)
+    if start is not None and began is not None and began != start:
+        # The number has been handed to somebody else. It cannot still be
+        # naming this session's group either: the kernel holds a pid back for
+        # as long as it names a group with members in it, so a reissued number
+        # is one whose group was already empty.
+        return
+    if start is not None and began == start:
+        signal_group(pid)
+        return
+    if leader_is_ours(pid, root):
+        signal_group(pid)
+        return
+    # The leader is gone - which is the ordinary case, because `stop` asks the
+    # compositor to quit before it sweeps - so the group can no longer vouch
+    # for its members and each survivor has to name itself.
+    #
+    # What "itself" is worth depends on the record. A command line naming this
+    # session's directory is proof on its own, whatever group it turns up in.
+    # A program name is not: `at-spi2-registryd` is what every session's bus is
+    # called, and the group it is standing in might not be this session's at
+    # all. What rules that out is the start time above - a record that carries
+    # one has already established that this pid is either the leader it names
+    # or gone, and a pid the kernel has not reissued still names the group it
+    # was given. A record written before start times were kept has established
+    # no such thing: its pid may since have been handed to another session's
+    # compositor, whose group leads to that session's live accessibility bus.
+    skipped: list[int] = []
+    for member in process_group(pid):
+        cmdline = process_cmdline(member)
+        if not cmdline:
+            continue
+        if names_root(cmdline, root):
+            signal_process(member)
+        elif Path(cmdline.split("\0", 1)[0]).name in ACCESSIBILITY_STRAYS:
+            if start is not None:
+                signal_process(member)
+            else:
+                skipped.append(member)
+    if skipped:
+        # Said out loud rather than swallowed, for the same reason `stop_xvfb`
+        # says it: the alternative to leaving these alone is killing somebody
+        # else's, and a caller told which pids they are can finish the job.
+        print(
+            f"warning: session at {root} predates this version and cannot"
+            " vouch for the process group it recorded; leaving its"
+            f" accessibility processes alone ({', '.join(map(str, skipped))})",
+            file=sys.stderr,
+        )
+
+
+def signal_process(pid: int) -> None:
+    for signal_number in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, signal_number)
+        except OSError:
+            return
+        for _ in range(20):
+            if reaped(pid):
+                return
+            time.sleep(0.05)
+
+
+def signal_group(pid: int) -> None:
+    for signal_number in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pid, signal_number)
+        except OSError:
+            return
+        for _ in range(20):
+            # A caller that started the compositor itself, rather than through
+            # a previous command, is still its parent: the leader then sits in
+            # its own group as an unreaped zombie, which `killpg` counts as
+            # present exactly as a live process would. Collect it, or the group
+            # can never look empty and every stop pays both signals in full.
+            reaped(pid)
+            try:
+                os.killpg(pid, 0)
+            except OSError:
+                return
+            time.sleep(0.05)
+
+
+def stop_session(session: Session, *, timeout: float = 10.0) -> str:
+    """End a session and everything it owns.
+
+    Asking the compositor to quit is only the first half. It takes its own
+    clients with it but not the accessibility bus, which is started alongside
+    the application rather than by it, so the process group is swept on every
+    path out - including the one where the compositor had already gone, which
+    is exactly the case that used to strand a registry per session.
+
+    The X server of a headless session is deliberately not a child of the
+    compositor - it has to outlive a compositor crash for the log to survive -
+    so it is reaped separately, after the group rather than with it: its
+    clients should lose their windows before they lose their display.
+    """
+    try:
+        if not session.alive():
+            return "already stopped"
+        session.niri("action", "quit", "--skip-confirmation", check=False, timeout=5)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not session.alive():
+                return "stopped"
+            time.sleep(0.1)
+        return "killed"
+    finally:
+        sweep_process_group(
+            session.pid, session.root, session.boot, session.pid_start
+        )
+        stop_xvfb(session)
+        session_file(session.name).unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------
@@ -536,7 +1211,10 @@ def outputs(session: Session) -> list[dict]:
 
 
 def pick_window(session: Session, match: str | None) -> dict:
-    found = windows(session)
+    return choose_window(windows(session), match)
+
+
+def choose_window(found: list[dict], match: str | None) -> dict:
     if not found:
         raise HarnessError("nested session has no windows")
     if match is None:
@@ -563,24 +1241,40 @@ def output_geometry(session: Session) -> tuple[int, int, str]:
     raise HarnessError("nested session reports no output geometry")
 
 
-def screenshot(session: Session, name: str) -> Path:
+def capture_frame(session: Session) -> "Image.Image":
+    """Capture one frame without disk I/O or PNG work."""
     require_tool("grim")
-    path = session.shots / name
-    run(["grim", str(path)], env=session.env, timeout=25)
-    return path
-
-
-def load_image(path: Path):
     from PIL import Image
 
-    return Image.open(path).convert("RGB")
+    proc = run(["grim", "-t", "ppm", "-"], env=session.env, timeout=25)
+    image = Image.open(BytesIO(proc.stdout))
+    image.load()
+    if image.mode != "RGB":
+        raise HarnessError(f"grim returned unexpected {image.mode} image")
+    return image
+
+def capture_png(session: Session, path: Path) -> tuple[int, int]:
+    """Write a retained PNG directly, without a full frame in Python."""
+    require_tool("grim")
+    from PIL import Image
+
+    run(["grim", "-t", "png", "-l", "1", str(path)], env=session.env, timeout=25)
+    with Image.open(path) as image:
+        return image.size
 
 
-def frame_stats(path: Path) -> tuple[float, tuple[int, int]]:
+def save_frame(image: "Image.Image", path: Path) -> None:
+    """Encode PNG artifacts quickly while preserving explicit output formats."""
+    if path.suffix.lower() == ".png":
+        image.save(path, format="PNG", compress_level=1)
+    else:
+        image.save(path)
+
+
+def frame_stats(image: "Image.Image") -> tuple[float, tuple[int, int]]:
     """Fraction of sampled pixels that differ from the most common value."""
     import numpy as np
 
-    image = load_image(path)
     array = np.asarray(image)
     step = max(1, min(array.shape[0], array.shape[1]) // 200)
     sample = array[::step, ::step].reshape(-1, 3)
@@ -592,19 +1286,22 @@ def frame_stats(path: Path) -> tuple[float, tuple[int, int]]:
     if packed.size == 0:
         return 0.0, image.size
     _, counts = np.unique(packed, return_counts=True)
-    return 1.0 - counts.max() / packed.size, image.size
+    # A plain float, not numpy's: these values reach `--json`, and a numpy
+    # scalar there is not a serialisation quirk but an unhandled traceback on
+    # the one interface a caller is meant to parse.
+    return float(1.0 - counts.max() / packed.size), image.size
 
 
-def frame_difference(first: Path, second: Path) -> float:
+def frame_difference(first: "Image.Image", second: "Image.Image") -> float:
     import numpy as np
 
-    a = np.asarray(load_image(first), dtype=np.int16)
-    b = np.asarray(load_image(second), dtype=np.int16)
+    a = np.asarray(first)
+    b = np.asarray(second)
     if a.shape != b.shape:
         return 1.0
     step = max(1, min(a.shape[0], a.shape[1]) // 300)
-    da = a[::step, ::step]
-    db = b[::step, ::step]
+    da = a[::step, ::step].astype(np.int16)
+    db = b[::step, ::step].astype(np.int16)
     changed = (np.abs(da - db).max(axis=2) > 12).mean()
     return float(changed)
 
@@ -636,10 +1333,20 @@ def heal(session: Session, *, window_match: str | None = None) -> list[str]:
         actions.append("closed overview")
 
     width, height, transform = output_geometry(session)
-    if transform != "Normal":
+    # niri reports Flipped180 for its own winit output as a matter of course,
+    # under both backends, and that transform is not real: captured frames come
+    # out the right way up, and a pointer sent to a logical coordinate lands at
+    # the matching framebuffer pixel. Asking to correct it returns success and
+    # changes nothing, so heal used to report "not correctable" on every single
+    # command - which is how a reader learns to skip the `healed:` line, and
+    # that line has to stay worth reading for the day a transform is real.
+    correctable = [
+        output for output in outputs(session) if output.get("name") != "winit"
+    ]
+    if transform != "Normal" and correctable:
         # Left alone this makes screenshot space and pointer space disagree,
         # so every located coordinate is wrong by a reflection.
-        for output in outputs(session):
+        for output in correctable:
             session.niri(
                 "output", str(output.get("name")), "transform", "normal", check=False
             )
@@ -662,13 +1369,34 @@ def heal(session: Session, *, window_match: str | None = None) -> list[str]:
         actions.append(f"focused window {window_id}")
 
     size = (window.get("layout") or {}).get("window_size") or [0, 0]
-    if size[0] < width * 0.9:
+    if round(size[0]) < width or round(size[1]) < height:
         # A half-width column makes every coordinate in a caller's notes wrong
         # the moment another window appears, so the target under test always
         # occupies the whole output.
+        #
+        # The comparison is the same one `window_origin` makes, deliberately.
+        # A window filling the output can only be at its origin, which is the
+        # only way accessibility coordinates can be placed on the screen at
+        # all, so anything heal is willing to leave short of that loses the
+        # tree - silently, for every window between 90% and 100% of the output.
         session.niri("action", "maximize-column", check=False)
         time.sleep(0.2)
-        actions.append("maximized column")
+        # Asked for, then checked, the way the transform above is. niri floats
+        # a window that asked not to be resized, `maximize-column` does not
+        # reach a floating window, and reporting "maximized column" there is
+        # reporting work that did not happen - on every command, forever, which
+        # is how a reader learns to skip the `healed:` line.
+        window = pick_window(session, window_match)
+        size = (window.get("layout") or {}).get("window_size") or [0, 0]
+        if round(size[0]) >= width and round(size[1]) >= height:
+            actions.append("maximized column")
+        elif window_origin(session, window) is None:
+            # Worth saying only when the window is also unplaceable. A floating
+            # window publishes `tile_pos_in_workspace_view`, so its tree can be
+            # placed where it stands and nothing has been lost by leaving it.
+            actions.append(
+                f"column not maximizable (still {round(size[0])}x{round(size[1])})"
+            )
 
     return actions
 
@@ -698,15 +1426,14 @@ def wait_window(
     raise HarnessError(f"{last_error} within {timeout:g}s")
 
 
-def wait_painted(session: Session, *, timeout: float = 20.0) -> Path:
+def wait_painted(session: Session, *, timeout: float = 20.0) -> "Image.Image":
     """Wait until the output has actually drawn something."""
     deadline = time.monotonic() + timeout
-    last: Path | None = None
     while time.monotonic() < deadline:
-        last = screenshot(session, "_painted.png")
-        variety, _ = frame_stats(last)
+        frame = capture_frame(session)
+        variety, _ = frame_stats(frame)
         if variety >= PAINTED_MIN_VARIETY:
-            return last
+            return frame
         time.sleep(0.3)
     raise HarnessError(
         f"output never painted within {timeout:g}s (still a near-uniform frame); "
@@ -714,15 +1441,21 @@ def wait_painted(session: Session, *, timeout: float = 20.0) -> Path:
     )
 
 
-def wait_stable(session: Session, *, timeout: float = 10.0, settle: float = 0.35) -> Path:
+def wait_stable(
+    session: Session,
+    *,
+    timeout: float = 10.0,
+    settle: float = 0.35,
+    initial: "Image.Image | None" = None,
+) -> "Image.Image":
     deadline = time.monotonic() + timeout
-    previous = screenshot(session, "_stable_a.png")
+    previous = initial or capture_frame(session)
     while time.monotonic() < deadline:
         time.sleep(settle)
-        current = screenshot(session, "_stable_b.png")
+        current = capture_frame(session)
         if frame_difference(previous, current) <= STABLE_MAX_DIFF_FRACTION:
             return current
-        previous = current.rename(session.shots / "_stable_a.png")
+        previous = current
     return previous
 
 
@@ -739,6 +1472,16 @@ class TextRun:
     width: int
     height: int
     confidence: float
+    # "ocr" for something read off the screen, or the accessibility role of a
+    # widget the application declared. The difference matters to a caller: a
+    # run of pixels that looks like a word may not be a control at all, while
+    # `push button` says so, and says whether it is enabled.
+    role: str = "ocr"
+    enabled: bool = True
+
+    @property
+    def source(self) -> str:
+        return "ocr" if self.role == "ocr" else "a11y"
 
     @property
     def center(self) -> tuple[int, int]:
@@ -765,7 +1508,16 @@ def _read_tile_once(scaled_path: str, min_confidence: float) -> list[dict]:
     try:
         proc = subprocess.run(
             ["tesseract", scaled_path, "stdout", "--psm", "3", "-l", "eng", "tsv"],
-            env={**os.environ, "TESSDATA_PREFIX": str(TESSDATA)},
+            # Each tile already runs in its own process, so tesseract's own
+            # OpenMP pool is pure oversubscription: 12 workers defaulting to one
+            # thread per core is 12 times the cores, and the contention shows up
+            # superlinearly on dense frames - 9.6 s against 1.1 s for identical
+            # output on one measured here.
+            env={
+                **os.environ,
+                "TESSDATA_PREFIX": str(TESSDATA),
+                "OMP_THREAD_LIMIT": "1",
+            },
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=120,
@@ -819,8 +1571,10 @@ def _ocr_tile(job: tuple[str, int, int, float]) -> list[dict]:
     from PIL import Image, ImageOps
 
     path, offset_x, offset_y, min_confidence = job
-    tile = Image.open(path).convert("L")
-    scaled = tile.resize((tile.width * OCR_SCALE, tile.height * OCR_SCALE), Image.LANCZOS)
+    with Image.open(path) as tile:
+        scaled = tile.resize(
+            (tile.width * OCR_SCALE, tile.height * OCR_SCALE), Image.LANCZOS
+        )
 
     histogram = scaled.histogram()
     total = sum(histogram) or 1
@@ -836,8 +1590,8 @@ def _ocr_tile(job: tuple[str, int, int, float]) -> list[dict]:
             prepared = ImageOps.autocontrast(
                 ImageOps.invert(scaled) if invert else scaled
             )
-            scaled_path = f"{path}.{'inv' if invert else 'dir'}.png"
-            prepared.save(scaled_path)
+            scaled_path = f"{path}.{'inv' if invert else 'dir'}.pgm"
+            prepared.save(scaled_path, format="PPM")
             raw = _read_tile_once(scaled_path, min_confidence)
             try:
                 os.unlink(scaled_path)
@@ -864,17 +1618,15 @@ def _ocr_tile(job: tuple[str, int, int, float]) -> list[dict]:
     ]
 
 
-def ocr_runs(path: Path, *, min_confidence: float = 45.0) -> list[TextRun]:
+def ocr_runs(image: "Image.Image", *, min_confidence: float = 45.0) -> list[TextRun]:
     require_tool("tesseract")
     ensure_built()
     import tempfile
     from concurrent.futures import ProcessPoolExecutor
 
-    from PIL import Image
-
     # Tiles are cut from the untouched frame; each worker decides its own
     # polarity and contrast, because those are properties of a region.
-    prepared = Image.open(path).convert("L")
+    prepared = image.convert("L")
     step = OCR_TILE - OCR_OVERLAP
     jobs: list[tuple[str, int, int, float]] = []
     scratch = tempfile.mkdtemp(prefix="niri-harness-ocr-")
@@ -886,8 +1638,8 @@ def ocr_runs(path: Path, *, min_confidence: float = 45.0) -> list[TextRun]:
                 min(left + OCR_TILE, prepared.width),
                 min(top + OCR_TILE, prepared.height),
             )
-            tile_path = os.path.join(scratch, f"{left}_{top}.png")
-            prepared.crop(box).save(tile_path)
+            tile_path = os.path.join(scratch, f"{left}_{top}.pgm")
+            prepared.crop(box).save(tile_path, format="PPM")
             jobs.append((tile_path, left, top, min_confidence))
 
     collected: list[dict] = []
@@ -911,6 +1663,502 @@ def ocr_runs(path: Path, *, min_confidence: float = 45.0) -> list[TextRun]:
         for entry in collected
     ]
     return merge_runs(deduplicate_runs(runs))
+
+
+def window_origin(session: Session, window: dict) -> tuple[int, int] | None:
+    """Where the window's top-left sits on the output, in logical pixels.
+
+    Accessibility coordinates are relative to the window, because a Wayland
+    client is never told where it is; the compositor holds the other half.
+    niri does publish `tile_pos_in_workspace_view` and it is honoured when it
+    is there, but in practice it is not: on 26.04 it is null even for an
+    ordinary focused, maximised, on-screen window, so the position nearly
+    always has to be established some other way.
+
+    A window as large as the output can only be at its origin. That is the
+    state `heal` produces and what almost every session is in, and it is
+    checkable rather than assumed. A smaller window could be anywhere, and
+    guessing the origin would place every declared control exactly as wrong as
+    the window's position, silently - so this says None instead, and the caller
+    reads the screen, where the coordinates were the output's to begin with.
+    """
+    layout = window.get("layout") or {}
+    position = layout.get("tile_pos_in_workspace_view")
+    offset = layout.get("window_offset_in_tile") or [0, 0]
+    if position:
+        return round(position[0] + offset[0]), round(position[1] + offset[1])
+    size = layout.get("window_size") or [0, 0]
+    logical_width, logical_height, _ = output_geometry(session)
+    if round(size[0]) >= logical_width and round(size[1]) >= logical_height:
+        return 0, 0
+    return None
+
+
+def nodes_for_window(
+    nodes: list[dict],
+    window: dict | None,
+    *,
+    focused: bool = False,
+    sole_window: bool = False,
+) -> list[dict]:
+    """Keep only the nodes belonging to the window being acted on.
+
+    The accessibility bus is per session, not per window, and the probe walks
+    every frame on it. Accessibility geometry is relative to a window, so
+    offsetting all of it by one window's origin puts controls belonging to a
+    window that may be scrolled out of view at coordinates belonging to the
+    window that is not - and a click on one of them lands on whatever happens
+    to be drawn there instead. Identical toolbars make it worse rather than
+    better: their boxes coincide exactly, so collapsing hides the duplicate and
+    leaves no sign of which window's control is being offered.
+
+    The probe numbers the frames it walks and records both the number and the
+    title, and niri's window title is the same string, so the two can be
+    matched.
+
+    One frame on the bus is not by itself the window in hand. A session whose
+    focused window declares nothing - a terminal, an SDL game, most things
+    under Xwayland - and holds any other window that does leaves exactly one
+    frame on the bus, and it belongs to the window nobody asked about. Only a
+    session holding one window as well has nowhere else for that frame to have
+    come from; that is the ordinary single-window session, and toolkits whose
+    frame name does not match their title keep working there.
+
+    Everything else is matched or refused, never guessed at. Two windows
+    sharing a title is not exotic - two unsaved documents do it - and the
+    title alone cannot separate their controls, which is why the frame number
+    decides and a title matching more than one of them counts as no match at
+    all. An empty answer sends the caller to the screen, where coordinates
+    need no window.
+    """
+    # The frame number identifies a window; the title is only what it is
+    # matched by. A payload without the number is refused rather than keyed on
+    # the title instead, because the title is precisely the thing that cannot
+    # do this job: two windows sharing one would collapse to a single frame and
+    # be waved through as though they were one window.
+    if any("frame" not in node for node in nodes):
+        return []
+    if sole_window and len({node["frame"] for node in nodes}) <= 1:
+        return nodes
+    # Titles are the weaker evidence and they are all an unfocused window has:
+    # they are not unique - two unsaved documents share one - and the tree was
+    # walked before the window was looked up, so an application that retitles
+    # in between is attributed against a title the payload never carried.
+    #
+    # The active frame needs neither. Exactly one window holds the session's
+    # focus and a toolkit marks that window's frame active, so while the window
+    # in hand is the focused one, the active frame is its frame whatever it is
+    # called. A probe too old to report it says nothing here rather than
+    # something wrong, and the titles decide as they did before.
+    matched: set = set()
+    if focused:
+        matched = {node["frame"] for node in nodes if node.get("active")}
+    if len(matched) != 1:
+        title = (window or {}).get("title") or ""
+        matched = {
+            node["frame"] for node in nodes if (node.get("window") or "") == title
+        }
+    if len(matched) != 1:
+        return []
+    return [node for node in nodes if node["frame"] in matched]
+
+
+def a11y_runs(
+    session: Session, *, window_match: str | None = None, budget: float = 5.0
+) -> tuple[list[TextRun] | None, str | None]:
+    """The application's own account of its controls, and why there is none.
+
+    Every outcome sends a caller that has nothing to the screen, so the runs
+    alone cannot distinguish them - and they are not the same thing at all. An
+    application that declares nothing is working as designed and OCR is the
+    right answer for it. A tree that answered in full but could not be placed
+    on the output, or could not be told apart from another window's, is a
+    capability being given up: the same labels come back without roles, without
+    enabled state, and an order of magnitude slower.
+
+    So the reason comes back alongside the runs, None when there is nothing to
+    explain, and `observe` reports it rather than downgrading in silence.
+    """
+    bus = session.bus
+    if bus is None or not A11Y_PROBE.exists():
+        return None, None
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(A11Y_PROBE), str(budget)],
+            env={**os.environ, "DBUS_SESSION_BUS_ADDRESS": bus},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=budget + 10,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "the probe did not answer within its budget"
+    except OSError as error:
+        return None, f"the probe could not be run ({error.strerror or error})"
+    if proc.returncode != 0:
+        return None, "the probe exited without an answer"
+    try:
+        payload = json.loads(proc.stdout or b"null")
+    except json.JSONDecodeError:
+        return None, "the probe's answer could not be read"
+    if not isinstance(payload, dict):
+        return None, "the probe's answer could not be read"
+
+    found = windows(session)
+    try:
+        window = choose_window(found, window_match)
+    except HarnessError:
+        return [], "there is no window to attribute it to"
+    origin = window_origin(session, window)
+    if origin is None:
+        # Without an origin the tree's coordinates cannot be put on the output.
+        # Giving nothing back is the honest answer: it sends the caller to the
+        # screen, rather than to a control at a coordinate quietly wrong by the
+        # window's position.
+        return [], (
+            "the window's position on the output is unknown, so its"
+            " coordinates cannot be placed on the screen"
+        )
+    origin_x, origin_y = origin
+    declared_nodes = payload.get("nodes") or []
+    nodes = nodes_for_window(
+        declared_nodes,
+        window,
+        focused=bool(window.get("is_focused")),
+        sole_window=len(found) == 1,
+    )
+    if declared_nodes and not nodes:
+        return [], (
+            "it could not be told apart from another window's on the same bus"
+        )
+    # Accessibility geometry is in logical pixels and every coordinate this
+    # tool reports is a framebuffer pixel, so the output's scale converts.
+    scale = output_scale(session)
+
+    runs = [
+        TextRun(
+            ref="",
+            text=node["text"],
+            x=round((origin_x + node["x"]) * scale),
+            y=round((origin_y + node["y"]) * scale),
+            width=max(1, round(node["width"] * scale)),
+            height=max(1, round(node["height"] * scale)),
+            confidence=100.0,
+            role=node.get("role") or "unknown",
+            enabled=bool(node.get("enabled", True)),
+        )
+        for node in nodes
+    ]
+    return collapse_widgets(runs), None
+
+
+# A toolkit nests its parts: a button holds a label, and both carry the same
+# name and very nearly the same box. Offered as separate targets they are noise
+# at best and an ambiguity error at worst, so the outermost thing that can
+# actually be operated wins.
+WIDGET_RANK = {
+    "push button": 0, "button": 0, "toggle button": 0, "check box": 0,
+    "radio button": 0, "menu item": 0, "check menu item": 0,
+    "radio menu item": 0, "link": 0, "page tab": 0, "list item": 0,
+    "combo box": 1, "entry": 1, "text": 1, "password text": 1, "slider": 1,
+    "spin button": 1, "switch": 1, "toggle": 1, "tree item": 1,
+    "table cell": 1,
+    "label": 3, "heading": 3,
+    # An open menu is a region, not a point. Its box covers every item in it,
+    # so its centre is whichever row happens to lie there - which is how
+    # `click Save` on a menu named `Save` lands on `Save As...`, silently.
+    # Ranked below a label so that anything else bearing the name wins,
+    # including a reading off the screen, which is where the items are.
+    "menu": 4,
+}
+
+# Roles whose node describes an area rather than a thing to aim at. Matching
+# one does not answer "where is this label" - it says the label is somewhere in
+# there - so the screen is read even though the tree replied, and even if some
+# other node answered properly, because the region may well hold the better
+# target and the tree is precisely what did not name it. Deliberately one role:
+# this is the seed the old container list grew from, and every addition has to
+# earn itself the same way, by a measured wrong click rather than by looking
+# plausible.
+REGION_ROLES = {"menu"}
+
+
+def same_control(first: TextRun, second: TextRun) -> bool:
+    """Whether two declared nodes are two accounts of one control.
+
+    A toolkit publishes one control several times over - a button and the
+    label inside it, a toggle and the button it also is - at boxes that
+    coincide, and a caller wants one target for it, not four.
+
+    A region is never one of those. `boxes_overlap` measures against the
+    smaller of the two boxes, so anything drawn inside an open menu covers it
+    completely and reads as the same control - and collapsing them drops the
+    menu, which is the one thing left saying the screen still has to be read
+    for the items the menu is hiding. A region and something inside it are the
+    same control only when they are also the same box.
+    """
+    if first.text.lower() != second.text.lower():
+        return False
+    if not boxes_overlap(first, second):
+        return False
+    if first.role in REGION_ROLES or second.role in REGION_ROLES:
+        return boxes_coextensive(first, second)
+    return True
+
+
+def collapse_widgets(runs: list[TextRun]) -> list[TextRun]:
+    """Keep one target per control, preferring the one that can be operated."""
+    kept: list[TextRun] = []
+    for candidate in sorted(runs, key=lambda r: WIDGET_RANK.get(r.role, 2)):
+        if any(same_control(existing, candidate) for existing in kept):
+            continue
+        kept.append(candidate)
+    kept.sort(key=lambda r: (r.y, r.x))
+    for index, run_ in enumerate(kept, start=1):
+        run_.ref = f"a{index}"
+    return kept
+
+
+def boxes_overlap(first: TextRun, second: TextRun, *, share: float = 0.5) -> bool:
+    """Whether two boxes cover enough of each other to be the same thing."""
+    width = min(first.x + first.width, second.x + second.width) - max(first.x, second.x)
+    height = min(first.y + first.height, second.y + second.height) - max(first.y, second.y)
+    if width <= 0 or height <= 0:
+        return False
+    smaller = min(first.width * first.height, second.width * second.height)
+    return bool(smaller) and (width * height) / smaller > share
+
+
+def match_runs(runs: list[TextRun], target: str) -> list[TextRun]:
+    """The runs a label names: an exact match if there is one, else substrings.
+
+    OCR sometimes glues an adjacent icon onto a label, so substring matching is
+    what absorbs `M (c) src/main.rs` for `src/main.rs`; an exact match has to
+    win outright when one exists, or a short label would be ambiguous against
+    every longer one containing it.
+    """
+    lowered = target.lower()
+    exact = [run_ for run_ in runs if run_.text.lower() == lowered]
+    return exact or [run_ for run_ in runs if lowered in run_.text.lower()]
+
+
+def needs_screen(declared: list[TextRun], targets: list[str] | None) -> bool:
+    """Whether the screen still has to be read once the tree has answered.
+
+    A tree that answers is not a tree that answers fully. A toolkit publishes
+    controls it has no name for - GTK4's menu items are the common case, and
+    they come back nameless and get dropped - and nothing an application draws
+    for itself was ever going to be in there at all. Treating the first answer
+    as the whole truth is how a control that is plainly on screen gets reported
+    as absent.
+
+    With targets in hand the question is precise and costs a dictionary lookup,
+    and the answer is usually no. Without them the caller has asked what is on
+    screen, and only the screen can finish that sentence.
+    """
+    if targets is None:
+        return True
+    return any(
+        not (matched := match_runs(declared, target))
+        or any(run.role in REGION_ROLES for run in matched)
+        for target in targets
+    )
+
+
+# How much of the larger of two boxes their overlap has to cover before they
+# are the same box rather than one inside the other.
+#
+# Measured, and the measurement is the point: a reading of something a control
+# merely encloses - a menu item in an open menu, a line of a document in a text
+# view, text drawn inside a list row - covers 4% of it. A reading glued onto a
+# control it genuinely belongs to covers 92% when the widget is tight around
+# its glyphs and 25% when it is padded, which most are. So this does not
+# separate glue from content; nothing measured here does. It sits in the empty
+# band above every content case, and glue on a padded widget falls below it.
+#
+# That is the safe side, because the two ways of being wrong are not equal. A
+# suppressed reading is a control that cannot be named at all and a `wait
+# --gone` that lies; a surviving one is a duplicate that costs a substring
+# click against a stale listing - "click a reference instead" where it used to
+# resolve. Exact labels are unaffected, and so is every fresh lookup.
+COEXTENSIVE_SHARE = 0.5
+
+
+def boxes_coextensive(first: TextRun, second: TextRun) -> bool:
+    """Whether two boxes are the same box, rather than one inside the other."""
+    width = min(first.x + first.width, second.x + second.width) - max(first.x, second.x)
+    height = min(first.y + first.height, second.y + second.height) - max(first.y, second.y)
+    if width <= 0 or height <= 0:
+        return False
+    larger = max(first.width * first.height, second.width * second.height)
+    return bool(larger) and (width * height) / larger > COEXTENSIVE_SHARE
+
+
+def says_no_more(reading: TextRun, control: TextRun) -> bool:
+    """Whether a reading names the control and nothing besides it."""
+    text = reading.text.strip().lower()
+    name = control.text.strip().lower()
+    return bool(text) and bool(name) and text in name
+
+
+def is_second_reading(reading: TextRun, control: TextRun, *, alone: bool) -> bool:
+    """Whether a screen reading is another account of a declared control.
+
+    Three questions, and collapsing any two of them has already cost a bug.
+
+    When the two boxes are the same box, they are the same thing and a shared
+    label settles it either way round: that is OCR having glued an icon or an
+    accelerator onto what it read, `Keyboard Shortcuts Ctrl+?` for `Keyboard
+    Shortcuts`.
+
+    Otherwise, a reading that says *more* than the control's name is content
+    the control merely encloses, never the control itself. A GTK4 popover takes
+    its name from the button that opened it, so a `Save` menu contains-matches
+    `Save As...` and `Save All`; a list row named `Report` encloses a canvas
+    drawing `Report 2024 final`; an entry named `Search` shows `Search results:
+    42 matches`. Suppressing those discards what the screen was read to recover.
+
+    A reading that says no *more* than the name - exactly it, or a truncation -
+    is the control read off the screen, but only when there is nothing else
+    inside the control for it to have been. `alone` is that test, and it is the
+    one geometry cannot make on its own: a `Save` menu holding a `Save` item is
+    a fifth of a percent of the menu's area, indistinguishable by ratio from an
+    ordinary button whose glyphs fill a sixth of it, and suppressing it sends
+    `click Save` to the middle of the open menu - a different row entirely, and
+    silently. A control that encloses one reading it has to account for is
+    described by it; a control that encloses several is holding them.
+
+    That test decides leaf controls and nothing else. A region is not a control
+    whose name a reading can be at all: its box covers what it contains rather
+    than what it is, and the count cannot separate an item it holds from its
+    own glyphs, because the count is of what OCR happened to read. A menu whose
+    second row tesseract missed - an icon row, a low-contrast row, one below
+    the visible area - looks exactly like a menu showing its own name, and a
+    one-item menu is that shape outright. So a region suppresses nothing. The
+    cost is a duplicate reading of a menubar item, which is published as a menu
+    while it is closed and is the same size as its own label; the alternative
+    cost is the item inside an open menu becoming unnameable.
+    """
+    text = reading.text.strip().lower()
+    name = control.text.strip().lower()
+    if not text or not name:
+        return False
+    if control.role in REGION_ROLES:
+        return False
+    if boxes_coextensive(reading, control):
+        return text in name or name in text
+    # Equality satisfies both containments, so the narrower question is asked
+    # first: it is the one that has an answer for a reading that says no more.
+    if text in name:
+        return alone
+    return False
+
+
+def merge_sources(declared: list[TextRun], scanned: list[TextRun]) -> list[TextRun]:
+    """Add what the screen shows to what the tree declared, without saying it twice.
+
+    Where both sources describe the same control the tree's account is the
+    better one: it carries a role and an enabled state, and its box is the
+    widget's rather than the glyphs'. A reading of a control already declared
+    is therefore dropped rather than offered as a second target competing with
+    it - two entries for one button turn an unambiguous click into a coin toss.
+
+    Which readings those are is `is_second_reading`'s question, and it is the
+    only thing standing between "the screen fills in what the tree left out"
+    and "the screen is discarded wherever the tree happened to overlap it".
+    Part of that answer is not a property of the pair at all but of the control:
+    whether it holds anything else, which is why the enclosures are counted
+    here and handed down.
+
+    Counted, not merely tallied, and only for leaves - a region neither
+    suppresses a reading nor speaks for one, because it does not own what its
+    box covers. A reading that is some *other* leaf control's own
+    name, at that control's own box, is already spoken for - it is that
+    control read off the screen, not content this one is holding. A toolbar
+    button showing its accelerator on the right is the ordinary shape: the gap
+    is too wide for OCR to glue, so the button encloses two readings, one of
+    them the accelerator's own label. Tallying both leaves the button looking
+    like something with content inside it, its own name survives as a second
+    target, and `click "Save docu"` becomes a coin toss between the two.
+    """
+    inside = [
+        {index for index, run in enumerate(scanned) if boxes_overlap(run, control)}
+        for control in declared
+    ]
+    held = [
+        {
+            index
+            for index in enclosed
+            if not any(
+                other is not control
+                and other.role not in REGION_ROLES
+                and index in elsewhere
+                and says_no_more(scanned[index], other)
+                for other, elsewhere in zip(declared, inside)
+            )
+        }
+        for control, enclosed in zip(declared, inside)
+    ]
+    return declared + [
+        run
+        for index, run in enumerate(scanned)
+        if not any(
+            index in enclosed
+            and is_second_reading(run, control, alone=len(content) == 1)
+            for control, enclosed, content in zip(declared, inside, held)
+        )
+    ]
+
+
+def locate(
+    session: Session,
+    *,
+    window_match: str | None = None,
+    prefer: str = "auto",
+    targets: list[str] | None = None,
+) -> tuple[list[TextRun], str, "Image.Image | None"]:
+    """Find everything on screen a caller could name, and say how.
+
+    Accessibility first, because it is both an order of magnitude cheaper and
+    strictly more truthful, then OCR for whatever it did not cover - a terminal
+    or a canvas declares nothing, and that is most of what this tool drives.
+
+    `targets` are the labels about to be looked up, and naming them is what
+    keeps the cheap path cheap: the screen is read only when the tree does not
+    already carry them. A caller that passes none is asking for everything, and
+    pays for the screen every time.
+
+    The frame comes back with the runs when one had to be captured, so a caller
+    that also wants to keep the screenshot does not pay for a second capture.
+    """
+    if prefer != "ocr":
+        declared, forgone = a11y_runs(session, window_match=window_match)
+        if declared:
+            if prefer == "a11y" or not needs_screen(declared, targets):
+                return declared, "a11y", None
+            frame = wait_stable(session)
+            return merge_sources(declared, ocr_runs(frame)), "a11y+ocr", frame
+        if prefer == "a11y":
+            # An observer forbidden the screen has nowhere to fall back to, so
+            # nothing from it has to mean the application really declares
+            # nothing. A tree that was walked and then discarded - because it
+            # could not be attributed to the window in hand, or placed on the
+            # output, or answered at all - says something else entirely, and
+            # every caller here reads an empty answer as absence: `wait --gone`
+            # would report a dialog closed while it is still on screen, and a
+            # click would report a label missing that is plainly there. Only
+            # `observe` can afford to report the reason and carry on, and it
+            # does not come through here.
+            if forgone is not None:
+                raise HarnessError(
+                    f"the accessibility tree could not be used: {forgone};"
+                    " and --observer a11y forbids reading the screen instead"
+                )
+            return [], "a11y", None
+    # Settling belongs with the capture that needs it, not before the choice of
+    # source: a frame read mid-animation reads the wrong screen, and a tree
+    # that answers never reads one at all and should not pay to wait for it.
+    frame = wait_stable(session)
+    return ocr_runs(frame), "ocr", frame
 
 
 def deduplicate_runs(runs: list[TextRun]) -> list[TextRun]:
@@ -981,30 +2229,86 @@ def observe(
     window_match: str | None,
     do_heal: bool,
     with_text: bool,
+    prefer: str = "auto",
 ) -> dict:
     healed = heal(session, window_match=window_match) if do_heal else []
-    # An application that has drawn nothing yet is worth waiting for, but a
-    # window that is legitimately near-uniform - a dark terminal holding one
-    # line - is not a failure to observe. Report the fact and carry on; the
-    # empty text list says the same thing in a way the caller can act on.
+    frame_path = session.shots / "_observed.png"
+    runs: list[TextRun] = []
+    source: str | None = None
+    frame = None
+
+    # Ask the application before looking at it. A tree that answers proves the
+    # window is up and populated, which is what the long wait for pixels below
+    # is really for, so that wait can be skipped outright when it does.
+    declared: list[TextRun] | None = None
+    forgone: str | None = None
+    if with_text and prefer != "ocr":
+        declared, forgone = a11y_runs(session, window_match=window_match)
+
     painted = True
-    try:
-        wait_painted(session)
-    except HarnessError:
-        painted = False
-    frame = wait_stable(session)
+    if declared and prefer == "auto":
+        # The screen is about to be read, and OCR of a frame caught mid-change
+        # reads the wrong screen.
+        frame = wait_stable(session)
+    elif declared or prefer == "a11y":
+        # Nothing will read this frame except the report and the paintedness
+        # check below, and neither is worth a third of a second of settling -
+        # least of all under the observer chosen for costing a tenth of what
+        # the others do.
+        frame = capture_frame(session)
+    else:
+        # An application that has drawn nothing yet is worth waiting for, but a
+        # window that is legitimately near-uniform - a dark terminal holding one
+        # line - is not a failure to observe. Report the fact and carry on; the
+        # empty text list says the same thing in a way the caller can act on.
+        # The budget is short because that second case is the common one, and
+        # waiting out a long one on every observe of a clean-looking window
+        # costs far more than the advisory flag is worth.
+        painted_frame = None
+        try:
+            painted_frame = wait_painted(session, timeout=6.0)
+        except HarnessError:
+            painted = False
+        frame = wait_stable(session, initial=painted_frame)
+
+    if declared:
+        runs, source = declared, "a11y"
+        if prefer == "auto":
+            # A declared control proves the window is mapped, not that a single
+            # pixel has been drawn, and the tree drops anything it has no name
+            # for. `observe` is the listing every other command is trusted
+            # against, so it reads the screen as well and reports the union.
+            runs, source = merge_sources(declared, ocr_runs(frame)), "a11y+ocr"
+    elif with_text and prefer != "a11y":
+        runs, source = ocr_runs(frame), "ocr"
+    elif prefer == "a11y":
+        # Asking only the tree means only the tree, whether or not it answered.
+        # Falling through to a full-frame OCR pass here would make `observe`
+        # and `wait` disagree about what the flag means, and would charge a
+        # second for the one observer chosen because it costs a tenth of that.
+        source = "a11y"
+
+    # Measured from the frame that was actually captured, rather than inferred
+    # from the tree having answered: a toolkit publishes its widgets before it
+    # paints them, so the two say different things about a window mid-start.
+    variety, _ = frame_stats(frame)
+    painted = bool(painted and variety >= PAINTED_MIN_VARIETY)
+
+    if frame is not None:
+        width, height = frame.size
+        save_frame(frame, frame_path)
+    else:
+        width, height = capture_png(session, frame_path)
     logical_w, logical_h, transform = output_geometry(session)
     # Every coordinate in `runs` is a framebuffer pixel, because that is what a
     # screenshot is, so the framebuffer is the geometry a caller reasons about.
     # The logical size is what the application laid out against.
-    width, height = load_image(frame).size
     window = pick_window(session, window_match)
-    runs = ocr_runs(frame) if with_text else []
     cache = session.root / "observed.json"
     cache.write_text(
         json.dumps(
             {
-                "frame": str(frame),
+                "frame": str(frame_path),
                 "runs": [run_.__dict__ for run_ in runs],
             },
             indent=2,
@@ -1029,7 +2333,9 @@ def observe(
         },
         "healed": healed,
         "painted": painted,
-        "frame": str(frame),
+        "source": source,
+        "forgone": forgone,
+        "frame": str(frame_path),
         "runs": runs,
     }
 
@@ -1042,39 +2348,139 @@ def load_observed(session: Session) -> list[TextRun]:
     return [TextRun(**entry) for entry in data["runs"]]
 
 
-def resolve_target(session: Session, target: str, *, fresh: bool) -> tuple[int, int, str]:
-    """Turn a ref, a label or an explicit coordinate into a click point."""
+def fresh_runs(
+    session: Session,
+    targets: list[str],
+    *,
+    window_match: str | None = None,
+    prefer: str = "auto",
+) -> list[TextRun]:
+    """Read the screen once, for however many targets are about to be named.
+
+    An action with two ends - a drag - has to resolve both against the same
+    view of the world. Reading again between them would resolve the second
+    against a screen the first has already changed.
+    """
+    # A coordinate names no label and needs nothing read. An `a` ref is the
+    # tree's own numbering and the tree will be walked regardless. A `t` ref is
+    # a reading off the screen, and only a listing that read the screen has
+    # one - so it has to force that read, or every `t` ref the last `observe`
+    # printed is unresolvable on any application that declares a tree.
+    wanted: list[str] = []
+    screen = False
+    for target in targets:
+        if re.fullmatch(r"\s*\d+\s*,\s*\d+\s*", target) or re.fullmatch(r"a\d+", target):
+            continue
+        if re.fullmatch(r"t\d+", target):
+            screen = True
+            continue
+        wanted.append(target)
+    runs, _, _ = locate(
+        session,
+        window_match=window_match,
+        prefer=prefer,
+        targets=None if screen else wanted,
+    )
+    return runs
+
+
+def resolve_target(
+    session: Session,
+    target: str,
+    *,
+    fresh: bool,
+    window_match: str | None = None,
+    prefer: str = "auto",
+    runs: list[TextRun] | None = None,
+) -> tuple[int, int, str]:
+    """Turn a ref, a label or an explicit coordinate into a click point.
+
+    When the application declares its controls, naming one costs a D-Bus walk
+    rather than a full-frame OCR pass - which is the difference between a click
+    that resolves in tens of milliseconds and one that resolves in a second.
+    An application that declares nothing falls through to reading the screen,
+    and a label that the tree does not carry does too, so nothing is lost by
+    asking the cheap source first.
+    """
     coordinate = re.fullmatch(r"\s*(\d+)\s*,\s*(\d+)\s*", target)
     if coordinate:
         return int(coordinate.group(1)), int(coordinate.group(2)), f"point {target}"
 
-    runs = ocr_runs(wait_stable(session)) if fresh else load_observed(session)
-    if re.fullmatch(r"t\d+", target):
+    if runs is None:
+        runs = (
+            fresh_runs(session, [target], window_match=window_match, prefer=prefer)
+            if fresh
+            else load_observed(session)
+        )
+    if re.fullmatch(r"[ta]\d+", target):
         for run_ in runs:
             if run_.ref == target:
                 x, y = run_.center
                 return x, y, f"{run_.ref} {run_.text!r}"
         raise HarnessError(f"no such reference {target!r}; re-run `observe`")
 
-    lowered = target.lower()
-    exact = [r for r in runs if r.text.lower() == lowered]
-    partial = [r for r in runs if lowered in r.text.lower()]
-    candidates = exact or partial
+    candidates = match_runs(runs, target)
     if not candidates:
         visible = ", ".join(repr(r.text) for r in runs[:40])
         raise HarnessError(f"no visible text matching {target!r}; visible: {visible}")
+    # `match_runs` answers with exact matches or with substring matches and
+    # never mixes the two, so any one candidate settles which kind these are.
+    exact = candidates[0].text.lower() == target.lower()
     if len(candidates) > 1 and not exact:
         where = ", ".join(f"{r.ref}@{r.x},{r.y} {r.text!r}" for r in candidates[:8])
         raise HarnessError(f"{target!r} is ambiguous: {where}; click a reference instead")
-    chosen = candidates[0]
+    # One label can name both a control that cannot be operated and one that
+    # can - a greyed toolbar button and its live twin in a menu - and reading
+    # order is no reason to prefer the one that would do nothing. Refusing on
+    # the strength of the first is how a perfectly clickable control becomes
+    # unreachable.
+    #
+    # That preference holds only between things of the same kind, though. A
+    # label and a screen reading carry `enabled` as a default rather than as an
+    # answer, so preferring any enabled candidate is how `click Zap` walks past
+    # the disabled `Zap` button the caller plainly meant and clicks a paragraph
+    # 400 pixels below that happens to say the same word. Operability ranks
+    # first - the same ordering `collapse_widgets` uses - and enabled decides
+    # within a rank.
+    chosen = min(
+        candidates,
+        key=lambda run_: (WIDGET_RANK.get(run_.role, 2), not run_.enabled),
+    )
+    # Refuse a disabled control only when something the application actually
+    # declared is enabled. That proves the toolkit reports the state at all;
+    # without the check, a toolkit that reports it nowhere would make
+    # everything unclickable. Only declared controls can vouch for that: an OCR
+    # run carries the field's default rather than an answer, so counting those
+    # would make the refusal depend on whether the screen happened to be read.
+    if not chosen.enabled and any(
+        run_.enabled for run_ in runs if run_.role != "ocr"
+    ):
+        raise HarnessError(
+            f"{chosen.text!r} is a disabled {chosen.role}; clicking it would do"
+            f" nothing. Pass its coordinates if you mean to click it anyway"
+        )
     x, y = chosen.center
-    # Repeated labels are ordinary in a real UI, so the first in reading order
-    # is a defensible choice - but never a silent one, because a click landing
-    # on the wrong copy is the hardest kind of failure to spot afterwards.
+    # Repeated labels are ordinary in a real UI, so picking one of them is a
+    # defensible choice - but never a silent one, because a click landing on
+    # the wrong copy is the hardest kind of failure to spot afterwards. The
+    # rest are named, and the one being clicked is not among them.
+    # Listed after the chosen one is taken out, not before: slicing first and
+    # filtering after shows five alternatives when the chosen one was among
+    # them and six when it was not, for no reason a reader could work out. What
+    # does not fit is counted, so "1 of 20" and a list of six do not look like
+    # an answer that lost fourteen of them somewhere.
+    rest = [r for r in candidates if r is not chosen]
+    others = ", ".join(f"{r.ref}@{r.x},{r.y}" for r in rest[:6])
+    if len(rest) > 6:
+        others += f", and {len(rest) - 6} more"
+    # A role is worth naming only when the application supplied one; "ocr" is
+    # the absence of one, not a kind of control.
+    described = f"{chosen.ref} {chosen.text!r}" if chosen.role == "ocr" else (
+        f"{chosen.ref} {chosen.role} {chosen.text!r}"
+    )
     if len(candidates) > 1:
-        others = ", ".join(f"{r.ref}@{r.x},{r.y}" for r in candidates[1:6])
-        return x, y, f"{chosen.ref} {chosen.text!r} (first of {len(candidates)}; others {others})"
-    return x, y, f"{chosen.ref} {chosen.text!r}"
+        return x, y, f"{described} (1 of {len(candidates)}; others {others})"
+    return x, y, described
 
 
 # --------------------------------------------------------------------------
@@ -1162,12 +2568,56 @@ def keyboard_key(session: Session, chord: str) -> None:
     run(["wtype", *argv], env=session.env, timeout=30)
 
 
+def drag(
+    session: Session,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    button: str = "left",
+    steps: int = 24,
+) -> None:
+    """Press at one point, travel to another, release.
+
+    The journey is sent as a run of small relative moves rather than one jump,
+    because a drag is interpreted from the motion between press and release:
+    an application deciding whether this is a drag at all wants to see the
+    pointer leave the press point, and a list reordering or a canvas selection
+    follows the path rather than the endpoints. Absolute placement cannot be
+    used for the travel - it works by pinning the pointer to the origin first,
+    which with a button held would drag through the corner of the screen.
+    """
+    from_x, from_y = pointer_point(session, *start)
+    to_x, to_y = pointer_point(session, *end)
+    commands = [
+        "a", str(from_x), str(from_y), ";", "w", "120",
+        ";", "d", button, ";", "w", "80",
+    ]
+    at_x, at_y = from_x, from_y
+    for step in range(1, max(1, steps) + 1):
+        next_x = round(from_x + (to_x - from_x) * step / max(1, steps))
+        next_y = round(from_y + (to_y - from_y) * step / max(1, steps))
+        commands += [";", "r", str(next_x - at_x), str(next_y - at_y), ";", "w", "12"]
+        at_x, at_y = next_x, next_y
+    commands += [";", "w", "120", ";", "u", button]
+    pointer(session, *commands)
+
+
 def scroll(session: Session, axis: str, notches: float) -> None:
     pointer(session, "s", "v" if axis.startswith("v") else "h", str(notches))
 
 
 # --------------------------------------------------------------------------
 # acting with proof
+
+def kept_shot_name(name: str) -> str:
+    """A kept screenshot must stay a readable PNG.
+
+    `--shot report` and `shot report` name the same artefact, so both give it
+    the same extension: without one, the file is a PNG that every image viewer
+    and every downstream tool refuses on the strength of its name alone.
+    """
+    return name if Path(name).suffix else f"{name}.png"
+
 
 
 def act(
@@ -1178,15 +2628,18 @@ def act(
     shot_name: str | None,
     settle: float,
 ) -> dict:
-    before = screenshot(session, "_act_before.png")
+    before = capture_frame(session)
     perform()
     time.sleep(settle)
     after = wait_stable(session)
     changed = frame_difference(before, after)
     kept = None
     if shot_name:
-        kept = session.shots / shot_name
-        shutil.copyfile(after, kept)
+        kept = session.shots / kept_shot_name(shot_name)
+        if kept.suffix.lower() == ".png":
+            capture_png(session, kept)
+        else:
+            save_frame(capture_frame(session), kept)
     return {
         "action": description,
         "frame_changed_fraction": round(changed, 5),
@@ -1231,19 +2684,73 @@ def render(payload: dict, *, as_json: bool) -> str:
         if payload.get("healed"):
             lines.append("healed: " + "; ".join(payload["healed"]))
         lines.append(f"frame={payload['frame']}")
+        if payload.get("forgone"):
+            lines.append(
+                "the application's accessibility tree was not used: "
+                f"{payload['forgone']}"
+            )
         runs = payload.get("runs") or []
         if runs:
-            lines.append(f"text runs ({len(runs)}):")
+            source = payload.get("source")
+            heading = {
+                "a11y": "controls, from the application's accessibility tree",
+                "ocr": "text runs, read off the screen",
+                "a11y+ocr": "controls the application declares, then what is"
+                " only on screen",
+            }.get(source, "text runs")
+            lines.append(f"{heading} ({len(runs)}):")
             for run_ in runs:
                 data = run_ if isinstance(run_, dict) else run_.__dict__
+                role = data.get("role", "ocr")
+                note = "" if role == "ocr" else f" [{role}]"
+                if data.get("enabled") is False:
+                    note += " (disabled)"
                 lines.append(
                     f"  [{data['ref']}] {data['x']:>5},{data['y']:>5} "
-                    f"{data['width']:>4}x{data['height']:<3} {data['text']}"
+                    f"{data['width']:>4}x{data['height']:<3} {data['text']}{note}"
                 )
         return "\n".join(lines)
     for key, value in payload.items():
         lines.append(f"{key}={value}")
     return "\n".join(lines)
+
+
+def crop_region(image: "Image.Image", spec: str) -> "Image.Image":
+    """Crop to LEFT,TOP,RIGHT,BOTTOM, naming the mistake instead of tracebacking.
+
+    A region is easy to get wrong — LEFT,TOP,WIDTH,HEIGHT is the obvious guess
+    and silently produces a reversed box — so a bad spec has to say which of the
+    four numbers is impossible, and against what frame size.
+    """
+    parts = spec.split(",")
+    if len(parts) != 4:
+        raise HarnessError(
+            f"bad --region {spec!r}: expected 4 comma-separated numbers "
+            f"LEFT,TOP,RIGHT,BOTTOM, got {len(parts)}"
+        )
+    try:
+        left, top, right, bottom = (int(value.strip()) for value in parts)
+    except ValueError:
+        raise HarnessError(
+            f"bad --region {spec!r}: LEFT,TOP,RIGHT,BOTTOM must all be integers"
+        ) from None
+    if right <= left or bottom <= top:
+        raise HarnessError(
+            f"bad --region {spec!r}: RIGHT must exceed LEFT and BOTTOM must exceed "
+            f"TOP (this is LEFT,TOP,RIGHT,BOTTOM, not LEFT,TOP,WIDTH,HEIGHT; "
+            f"you may have meant {left},{top},{left + right},{top + bottom})"
+        )
+    box = (
+        max(0, min(left, image.width)),
+        max(0, min(top, image.height)),
+        max(0, min(right, image.width)),
+        max(0, min(bottom, image.height)),
+    )
+    if box[2] <= box[0] or box[3] <= box[1]:
+        raise HarnessError(
+            f"--region {spec!r} lies outside the {image.width}x{image.height} frame"
+        )
+    return image.crop(box)
 
 
 # --------------------------------------------------------------------------
@@ -1261,6 +2768,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-heal", action="store_true", help="skip the pre-action repair pass"
     )
+    parser.add_argument(
+        "--observer",
+        choices=["auto", "a11y", "ocr"],
+        default="auto",
+        help=(
+            "where labels come from: auto asks the application's accessibility"
+            " tree and reads the screen when it declares nothing, a11y asks only"
+            " the tree, ocr reads only the screen"
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     session = sub.add_parser("session", help="manage nested sessions")
@@ -1272,6 +2789,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--portal",
         choices=sorted(PORTAL_BACKENDS),
         help="run on a private bus so portal dialogs appear inside the session",
+    )
+    start.add_argument(
+        "--backend",
+        choices=["headless", "window"],
+        default="headless",
+        help=(
+            "headless: the compositor draws into a private X server, so nothing"
+            " maps on the host and nothing throttles it. window: it draws into a"
+            " window on the host, which the host stops painting when that window"
+            " scrolls out of view"
+        ),
+    )
+    start.add_argument(
+        "--host-bus",
+        action="store_true",
+        help="share the caller's D-Bus session instead of giving the session its own",
     )
     start.add_argument("--env", action="append", default=[], metavar="K=V")
     start.add_argument("--timeout", type=float, default=40.0)
@@ -1290,8 +2823,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="1600",
         metavar="PX",
         help=(
-            "logical width the application lays out against, set with the nested"
-            " output's scale; 'host' accepts the host's own sizing"
+            "logical width the application lays out against. A headless session"
+            " is built at that size exactly; a window session trades the nested"
+            " output's scale for it. 'host' takes whatever the backend gives,"
+            " which headless has no host to ask and so sizes at its own default"
         ),
     )
     session_sub.add_parser("list", help="list known sessions")
@@ -1326,6 +2861,14 @@ def build_parser() -> argparse.ArgumentParser:
     key_cmd.add_argument("chords", nargs="+")
     key_cmd.add_argument("--shot")
     key_cmd.add_argument("--settle", type=float, default=0.4)
+
+    drag_cmd = sub.add_parser("drag", help="press at one target, release at another")
+    drag_cmd.add_argument("start")
+    drag_cmd.add_argument("end")
+    drag_cmd.add_argument("--button", default="left", choices=["left", "right", "middle"])
+    drag_cmd.add_argument("--steps", type=int, default=24)
+    drag_cmd.add_argument("--shot")
+    drag_cmd.add_argument("--settle", type=float, default=0.4)
 
     scroll_cmd = sub.add_parser("scroll", help="scroll the pointer's surface")
     scroll_cmd.add_argument("axis", choices=["v", "h", "vertical", "horizontal"])
@@ -1367,6 +2910,7 @@ def main(argv: list[str] | None = None) -> int:
                 window_match=args.window,
                 do_heal=do_heal,
                 with_text=not args.no_text,
+                prefer=args.observer,
             )
             print(render(payload, as_json=args.json))
             return 0
@@ -1390,7 +2934,13 @@ def main(argv: list[str] | None = None) -> int:
             heal(session, window_match=args.window)
 
         if args.command == "click":
-            x, y, label = resolve_target(session, args.target, fresh=not args.stale_ok)
+            x, y, label = resolve_target(
+                session,
+                args.target,
+                fresh=not args.stale_ok,
+                window_match=args.window,
+                prefer=args.observer,
+            )
             result = act(
                 session,
                 f"click {label} at {x},{y}",
@@ -1428,9 +2978,38 @@ def main(argv: list[str] | None = None) -> int:
             print(render(result, as_json=args.json))
             return 0
 
+        if args.command == "drag":
+            seen = fresh_runs(
+                session, [args.start, args.end],
+                window_match=args.window, prefer=args.observer,
+            )
+            from_x, from_y, from_label = resolve_target(
+                session, args.start, fresh=True,
+                window_match=args.window, prefer=args.observer, runs=seen,
+            )
+            to_x, to_y, to_label = resolve_target(
+                session, args.end, fresh=True,
+                window_match=args.window, prefer=args.observer, runs=seen,
+            )
+            result = act(
+                session,
+                f"drag {from_label} at {from_x},{from_y} to {to_label} at {to_x},{to_y}",
+                lambda: drag(
+                    session, (from_x, from_y), (to_x, to_y),
+                    button=args.button, steps=args.steps,
+                ),
+                shot_name=args.shot,
+                settle=args.settle,
+            )
+            print(render(result, as_json=args.json))
+            return 0
+
         if args.command == "scroll":
             if args.at:
-                x, y, _ = resolve_target(session, args.at, fresh=True)
+                x, y, _ = resolve_target(
+                    session, args.at, fresh=True,
+                    window_match=args.window, prefer=args.observer,
+                )
                 move_pointer(session, x, y)
             result = act(
                 session,
@@ -1443,26 +3022,58 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "shot":
-            frame = wait_stable(session)
-            path = session.shots / args.name
-            image = load_image(frame)
-            if args.region:
-                left, top, right, bottom = (int(v) for v in args.region.split(","))
-                image = image.crop((left, top, right, bottom))
-            if args.scale != 1.0:
-                image = image.resize(
-                    (max(1, int(image.width * args.scale)), max(1, int(image.height * args.scale)))
-                )
-            image.save(path)
-            print(render({"shot": str(path), "size": f"{image.width}x{image.height}"}, as_json=args.json))
+            wait_stable(session)
+            path = session.shots / kept_shot_name(args.name)
+            if not args.region and args.scale == 1.0 and path.suffix.lower() == ".png":
+                width, height = capture_png(session, path)
+            else:
+                image = capture_frame(session)
+                if args.region:
+                    image = crop_region(image, args.region)
+                if args.scale != 1.0:
+                    image = image.resize(
+                        (
+                            max(1, int(image.width * args.scale)),
+                            max(1, int(image.height * args.scale)),
+                        )
+                    )
+                save_frame(image, path)
+                width, height = image.size
+            print(render({"shot": str(path), "size": f"{width}x{height}"}, as_json=args.json))
             return 0
 
         if args.command == "wait":
             deadline = time.monotonic() + args.timeout
             lowered = args.text.lower()
+            first = True
             while time.monotonic() < deadline:
-                runs = ocr_runs(wait_stable(session, timeout=4.0))
+                # Naming the target is what makes `--gone` trustworthy: the
+                # tree answering without it is not evidence of absence, and
+                # without this the wait would report a dialog closed while it
+                # was still on screen.
+                runs, _, _ = locate(
+                    session,
+                    window_match=args.window,
+                    prefer=args.observer,
+                    targets=[args.text],
+                )
                 present = any(lowered in r.text.lower() for r in runs)
+                if first and args.gone and not present and args.observer == "a11y":
+                    # Absence is the one claim the tree cannot make on its own.
+                    # A menu item, a canvas label, anything a terminal draws is
+                    # missing from it while plainly on screen, so "not in the
+                    # tree" and "gone from the screen" are the same answer here
+                    # - and this one comes back in a tenth of a second, which
+                    # is exactly the kind a caller banks on. Having seen it
+                    # present first is what makes the disappearance evidence;
+                    # without that there is nothing to have disappeared.
+                    raise HarnessError(
+                        f"{args.text!r} is not in the accessibility tree, so"
+                        " --observer a11y cannot tell whether it has gone or"
+                        " was never named there. Drop --observer a11y and let"
+                        " the screen decide."
+                    )
+                first = False
                 if present != args.gone:
                     print(
                         render(
@@ -1483,11 +3094,20 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "logs":
             log = session.root / "session.log"
-            if not log.exists():
+            lines = (
+                log.read_text(errors="replace").splitlines()[-args.lines :]
+                if log.exists()
+                else []
+            )
+            if args.json:
+                # Structured like every other command, because a caller parsing
+                # `--json` should not have to special-case one of them. The
+                # lines stay a list: an application's output is not a field.
+                print(render({"log": str(log), "lines": lines}, as_json=True))
+            elif not log.exists():
                 print("no application log yet")
-                return 0
-            lines = log.read_text(errors="replace").splitlines()
-            print("\n".join(lines[-args.lines :]))
+            else:
+                print("\n".join(lines))
             return 0
 
     except HarnessError as error:
@@ -1525,6 +3145,8 @@ def session_command(args) -> int:
             timeout=args.timeout,
             expect_window=not args.no_window_wait,
             width=width,
+            backend=args.backend,
+            host_bus=args.host_bus,
         )
         if args.no_window_wait:
             print(render({"session": args.name, "started": True}, as_json=args.json))
@@ -1544,13 +3166,14 @@ def session_command(args) -> int:
                 "display": s.display,
                 "pid": s.pid,
                 "alive": s.alive(),
+                "backend": s.backend,
                 "root": str(s.root),
             }
             for s in list_sessions()
         ]
         print(json.dumps(rows, indent=2) if args.json else "\n".join(
             f"{r['name']:<16} {r['display']:<12} pid={r['pid']:<8} "
-            f"{'live' if r['alive'] else 'dead'} {r['root']}"
+            f"{r['backend']:<9} {'live' if r['alive'] else 'dead'} {r['root']}"
             for r in rows
         ) or "no sessions")
         return 0
