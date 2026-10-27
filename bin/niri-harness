@@ -247,7 +247,7 @@ def _viewport_output(session: Session, name: str | None = None) -> tuple[dict, d
             or any(type(logical.get(key)) is not int or logical[key] <= 0
                    for key in ("width", "height"))):
         raise HarnessError("nested output reports invalid mode geometry")
-    if logical.get("transform") not in {
+    if not isinstance(logical.get("transform"), str) or logical["transform"] not in {
         "Normal", "90", "180", "270", "Flipped", "Flipped90",
         "Flipped180", "Flipped270",
     }:
