@@ -337,6 +337,215 @@ def test_ocr_reads_both_polarities() -> None:
 
 
 # --------------------------------------------------------------------------
+# absolute viewport fitting (pure IPC mocks; no nested compositor)
+
+
+class ViewportFitSession:
+    """A fixed physical output whose logical size follows compositor scale.
+
+    The physical viewport is supplied separately from the IPC metadata so the
+    mock does not reimplement the harness's mode selection or transform parser.
+    """
+
+    def __init__(self, *, logical=(1280, 720), scale=1.0, transform="Normal",
+                 mode=(1280, 720), viewport=(1280, 720), applied_scale=None,
+                 disabled_first=False, action_returncode=0, mode_after=None):
+        self.active = {
+            "logical": {"width": logical[0], "height": logical[1],
+                        "scale": scale, "transform": transform},
+            "modes": [{"width": mode[0], "height": mode[1]}],
+            "current_mode": 0,
+        }
+        self.records = {}
+        if disabled_first:
+            self.records["DISABLED"] = {"logical": None, "modes": [],
+                                        "current_mode": None}
+        self.records["NESTED"] = self.active
+        self.viewport = viewport
+        self.applied_scale = applied_scale
+        self.actions = []
+        self.action_returncode = action_returncode
+        self.mode_after = mode_after
+
+    def niri_json(self, *args):
+        assert args == ("outputs",), args
+        # An IPC result is a snapshot, not an alias into compositor state.
+        return json.loads(json.dumps(self.records))
+
+    def niri(self, *args, **kwargs):
+        assert len(args) == 4 and args[0] == "output" and args[2] == "scale", args
+        assert kwargs == {"check": False, "timeout": 10}, kwargs
+        self.actions.append(args)
+        requested = float(args[3])
+        actual = requested if self.applied_scale is None else self.applied_scale
+        logical = self.records[args[1]]["logical"]
+        # Disabled outputs reject scale changes, as a compositor would.
+        if logical is None or self.action_returncode:
+            return subprocess.CompletedProcess(args, self.action_returncode or 1)
+        logical.update(width=round(self.viewport[0] / actual),
+                       height=round(self.viewport[1] / actual), scale=actual)
+        if self.mode_after is not None:
+            self.active["modes"] = [self.mode_after]
+        return subprocess.CompletedProcess(args, 0)
+
+
+def viewport_fit(session, width):
+    from unittest.mock import patch
+
+    # Even a future implementation must not launch a tool in these pure tests.
+    with patch.object(H.time, "sleep"), patch.object(
+        H, "run", side_effect=AssertionError("viewport mock launched a tool")
+    ), patch.object(subprocess, "Popen", side_effect=AssertionError(
+        "viewport mock launched a subprocess"
+    )):
+        return H.fit_nested_viewport(session, width)
+
+
+def test_viewport_fit_repeated_width_is_idempotent() -> None:
+    session = ViewportFitSession()
+    viewport_fit(session, 900)
+    viewport_fit(session, 900)
+    scales = [float(action[3]) for action in session.actions]
+    check("both fits use the unchanged physical width", scales == [1.422, 1.422],
+          str(scales))
+    check("second fit retains the narrow logical viewport",
+          H.output_geometry(session) == (900, 506, "Normal"),
+          str(H.output_geometry(session)))
+
+
+def test_viewport_fit_nonunit_initial_scale_is_absolute() -> None:
+    session = ViewportFitSession(logical=(640, 360), scale=2.0)
+    viewport_fit(session, 900)
+    scales = [float(action[3]) for action in session.actions]
+    check("initial scale does not shrink the physical mode", scales == [1.422],
+          str(scales))
+
+
+def test_viewport_fit_narrow_wide_narrow_returns_to_same_scale() -> None:
+    session = ViewportFitSession()
+    for width in (900, 1600, 900):
+        viewport_fit(session, width)
+    scales = [float(action[3]) for action in session.actions]
+    check("width sequence has no accumulated scale drift",
+          scales == [1.422, 0.8, 1.422], str(scales))
+
+
+def test_viewport_fit_transforms_use_physical_axes() -> None:
+    cases = (
+        ("Normal", (1280, 720), (1920, 1080), 2.133),
+        ("180", (1280, 720), (1920, 1080), 2.133),
+        ("Flipped", (1280, 720), (1920, 1080), 2.133),
+        ("Flipped180", (1280, 720), (1920, 1080), 2.133),
+        ("90", (720, 1280), (1080, 1920), 1.2),
+        ("270", (720, 1280), (1080, 1920), 1.2),
+        ("Flipped90", (720, 1280), (1080, 1920), 1.2),
+        ("Flipped270", (720, 1280), (1080, 1920), 1.2),
+    )
+    for transform, logical, viewport, expected in cases:
+        session = ViewportFitSession(logical=logical, scale=1.5,
+                                     transform=transform, mode=(1920, 1080),
+                                     viewport=viewport)
+        viewport_fit(session, 900)
+        scales = [float(action[3]) for action in session.actions]
+        check(f"{transform} fits its physical horizontal extent",
+              scales == [expected], str(scales))
+
+
+def test_viewport_fit_reports_actual_quantized_scale() -> None:
+    session = ViewportFitSession(applied_scale=1.5)
+    report = viewport_fit(session, 900)
+    check("request still uses physical mode",
+          [float(action[3]) for action in session.actions] == [1.422], report)
+    check("report uses compositor's applied scale", "scale 1.5" in report, report)
+    check("report retains physical framebuffer size",
+          "framebuffer 1280x720" in report, report)
+    check("report uses actual logical geometry", "viewport 853x480 logical" in report,
+          report)
+
+
+def test_viewport_fit_selects_active_output_before_action() -> None:
+    session = ViewportFitSession(disabled_first=True)
+    report = viewport_fit(session, 900)
+    check("disabled first record never receives a scale action",
+          [action[1] for action in session.actions] == ["NESTED"], str(session.actions))
+    check("selected active output is fitted and reported",
+          "viewport 900x506 logical" in report, report)
+
+
+def test_viewport_fit_refuses_unknown_physical_mode_before_action() -> None:
+    invalid = (
+        ("missing current mode", "current_mode", None),
+        ("negative current mode", "current_mode", -1),
+        ("out of range mode", "current_mode", 1),
+        ("boolean current mode", "current_mode", True),
+        ("fractional current mode", "current_mode", 0.0),
+        ("string current mode", "current_mode", "0"),
+        ("missing mode list", "modes", None),
+        ("empty mode list", "modes", []),
+        ("malformed mode", "modes", [None]),
+        ("unknown physical width", "modes", [{"width": 0, "height": 720}]),
+    )
+    for label, key, value in invalid:
+        session = ViewportFitSession()
+        session.active[key] = value
+        report = viewport_fit(session, 900)
+        check(f"{label} is refused before action", not session.actions,
+              str(session.actions))
+        check(f"{label} reports refusal", "left alone" in report, report)
+    session = ViewportFitSession(transform="unknown-transform")
+    report = viewport_fit(session, 900)
+    check("unknown transform is refused before action", not session.actions,
+          str(session.actions))
+    check("unknown transform reports refusal", "left alone" in report, report)
+
+
+def test_viewport_fit_refuses_nonstring_transform_before_action() -> None:
+    for label, transform in (("list", ["Normal"]), ("dict", {"name": "Normal"})):
+        session = ViewportFitSession(transform=transform)
+        try:
+            report = viewport_fit(session, 900)
+        except TypeError as error:
+            check(f"{label} transform is refused without a type error", False, str(error))
+            check(f"{label} transform causes no output action", not session.actions,
+                  str(session.actions))
+            continue
+        check(f"{label} transform is refused before action", not session.actions,
+              str(session.actions))
+        check(f"{label} transform reports refusal", "left alone" in report, report)
+
+
+def test_viewport_fit_reports_failed_output_action() -> None:
+    session = ViewportFitSession(action_returncode=1)
+    report = viewport_fit(session, 900)
+    check("failed action is attempted once on the selected output",
+          session.actions == [("output", "NESTED", "scale", "1.422")],
+          str(session.actions))
+    check("failed action is explicitly reported", "scale request failed" in report,
+          report)
+    check("failed action reports the unchanged actual viewport and scale",
+          "viewport 1280x720 logical" in report and "scale 1," in report, report)
+
+
+def test_viewport_fit_reports_mode_change_during_apply() -> None:
+    session = ViewportFitSession(mode_after={"width": 1920, "height": 1080})
+    report = viewport_fit(session, 900)
+    check("mode change does not trigger another scale action",
+          session.actions == [("output", "NESTED", "scale", "1.422")],
+          str(session.actions))
+    check("mode change is explicitly reported",
+          "output mode or transform changed during fit" in report, report)
+    check("report uses the newly observed physical mode",
+          "framebuffer 1920x1080" in report, report)
+
+
+def test_viewport_fit_keeps_logical_output_geometry_contract() -> None:
+    session = ViewportFitSession(logical=(853, 480), scale=1.5)
+    check("geometry accessor remains logical despite physical mode metadata",
+          H.output_geometry(session) == (853, 480, "Normal"),
+          str(H.output_geometry(session)))
+
+
+# --------------------------------------------------------------------------
 # end to end
 
 
@@ -1793,6 +2002,17 @@ def test_heal_claims_no_repair_it_did_not_make() -> None:
 
 def main() -> int:
     tests = [
+        test_viewport_fit_repeated_width_is_idempotent,
+        test_viewport_fit_nonunit_initial_scale_is_absolute,
+        test_viewport_fit_narrow_wide_narrow_returns_to_same_scale,
+        test_viewport_fit_transforms_use_physical_axes,
+        test_viewport_fit_reports_actual_quantized_scale,
+        test_viewport_fit_selects_active_output_before_action,
+        test_viewport_fit_refuses_unknown_physical_mode_before_action,
+        test_viewport_fit_refuses_nonstring_transform_before_action,
+        test_viewport_fit_reports_failed_output_action,
+        test_viewport_fit_reports_mode_change_during_apply,
+        test_viewport_fit_keeps_logical_output_geometry_contract,
         test_shared_options_are_accepted_either_side_of_the_command,
         test_start_takes_the_program_and_its_arguments_verbatim,
         test_a_session_is_named_after_its_program,
