@@ -349,7 +349,7 @@ class ViewportFitSession:
 
     def __init__(self, *, logical=(1280, 720), scale=1.0, transform="Normal",
                  mode=(1280, 720), viewport=(1280, 720), applied_scale=None,
-                 disabled_first=False):
+                 disabled_first=False, action_returncode=0, mode_after=None):
         self.active = {
             "logical": {"width": logical[0], "height": logical[1],
                         "scale": scale, "transform": transform},
@@ -364,6 +364,8 @@ class ViewportFitSession:
         self.viewport = viewport
         self.applied_scale = applied_scale
         self.actions = []
+        self.action_returncode = action_returncode
+        self.mode_after = mode_after
 
     def niri_json(self, *args):
         assert args == ("outputs",), args
@@ -378,10 +380,12 @@ class ViewportFitSession:
         actual = requested if self.applied_scale is None else self.applied_scale
         logical = self.records[args[1]]["logical"]
         # Disabled outputs reject scale changes, as a compositor would.
-        if logical is None:
-            return subprocess.CompletedProcess(args, 1)
+        if logical is None or self.action_returncode:
+            return subprocess.CompletedProcess(args, self.action_returncode or 1)
         logical.update(width=round(self.viewport[0] / actual),
                        height=round(self.viewport[1] / actual), scale=actual)
+        if self.mode_after is not None:
+            self.active["modes"] = [self.mode_after]
         return subprocess.CompletedProcess(args, 0)
 
 
@@ -493,6 +497,45 @@ def test_viewport_fit_refuses_unknown_physical_mode_before_action() -> None:
     check("unknown transform is refused before action", not session.actions,
           str(session.actions))
     check("unknown transform reports refusal", "left alone" in report, report)
+
+
+def test_viewport_fit_refuses_nonstring_transform_before_action() -> None:
+    for label, transform in (("list", ["Normal"]), ("dict", {"name": "Normal"})):
+        session = ViewportFitSession(transform=transform)
+        try:
+            report = viewport_fit(session, 900)
+        except TypeError as error:
+            check(f"{label} transform is refused without a type error", False, str(error))
+            check(f"{label} transform causes no output action", not session.actions,
+                  str(session.actions))
+            continue
+        check(f"{label} transform is refused before action", not session.actions,
+              str(session.actions))
+        check(f"{label} transform reports refusal", "left alone" in report, report)
+
+
+def test_viewport_fit_reports_failed_output_action() -> None:
+    session = ViewportFitSession(action_returncode=1)
+    report = viewport_fit(session, 900)
+    check("failed action is attempted once on the selected output",
+          session.actions == [("output", "NESTED", "scale", "1.422")],
+          str(session.actions))
+    check("failed action is explicitly reported", "scale request failed" in report,
+          report)
+    check("failed action reports the unchanged actual viewport and scale",
+          "viewport 1280x720 logical" in report and "scale 1," in report, report)
+
+
+def test_viewport_fit_reports_mode_change_during_apply() -> None:
+    session = ViewportFitSession(mode_after={"width": 1920, "height": 1080})
+    report = viewport_fit(session, 900)
+    check("mode change does not trigger another scale action",
+          session.actions == [("output", "NESTED", "scale", "1.422")],
+          str(session.actions))
+    check("mode change is explicitly reported",
+          "output mode or transform changed during fit" in report, report)
+    check("report uses the newly observed physical mode",
+          "framebuffer 1920x1080" in report, report)
 
 
 def test_viewport_fit_keeps_logical_output_geometry_contract() -> None:
@@ -1966,6 +2009,9 @@ def main() -> int:
         test_viewport_fit_reports_actual_quantized_scale,
         test_viewport_fit_selects_active_output_before_action,
         test_viewport_fit_refuses_unknown_physical_mode_before_action,
+        test_viewport_fit_refuses_nonstring_transform_before_action,
+        test_viewport_fit_reports_failed_output_action,
+        test_viewport_fit_reports_mode_change_during_apply,
         test_viewport_fit_keeps_logical_output_geometry_contract,
         test_shared_options_are_accepted_either_side_of_the_command,
         test_start_takes_the_program_and_its_arguments_verbatim,
