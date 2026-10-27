@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -222,6 +223,41 @@ def restore_host_focus(window_id: int | None) -> str | None:
     return f"focus returned to host window {window_id}"
 
 
+def _viewport_output(session: Session, name: str | None = None) -> tuple[dict, dict]:
+    """Read one active output and its physical mode from the same IPC snapshot."""
+    active = [
+        output for output in outputs(session)
+        if isinstance(output, dict) and output.get("logical") is not None
+        and (name is None or output.get("name") == name)
+    ]
+    if len(active) != 1:
+        raise HarnessError("nested session reports no unique active output")
+    output = active[0]
+    logical = output.get("logical")
+    modes = output.get("modes")
+    index = output.get("current_mode")
+    if (not isinstance(output.get("name"), str) or not output["name"]
+            or not isinstance(logical, dict) or not isinstance(modes, list)
+            or type(index) is not int or not 0 <= index < len(modes)):
+        raise HarnessError("nested output reports no active physical mode")
+    mode = modes[index]
+    if (not isinstance(mode, dict)
+            or any(type(mode.get(key)) is not int or mode[key] <= 0
+                   for key in ("width", "height"))
+            or any(type(logical.get(key)) is not int or logical[key] <= 0
+                   for key in ("width", "height"))):
+        raise HarnessError("nested output reports invalid mode geometry")
+    if logical.get("transform") not in {
+        "Normal", "90", "180", "270", "Flipped", "Flipped90",
+        "Flipped180", "Flipped270",
+    }:
+        raise HarnessError("nested output reports an unknown transform")
+    scale = logical.get("scale")
+    if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+        raise HarnessError("nested output reports an invalid scale")
+    return output, mode
+
+
 def fit_nested_viewport(session: Session, width: int) -> str:
     """Give the application the logical width the caller asked for.
 
@@ -236,27 +272,34 @@ def fit_nested_viewport(session: Session, width: int) -> str:
     viewport is the framebuffer divided by the scale. Screenshots and pointer
     coordinates stay in framebuffer pixels, so nothing about clicking changes.
     """
-    try:
-        physical_w, physical_h, _ = output_geometry(session)
-    except HarnessError:
-        return "nested output reported no geometry; viewport left alone"
-    if physical_w <= 0 or width <= 0:
+    if type(width) is not int or width <= 0:
         return "nested output has no width; viewport left alone"
-
-    names = list((session.niri_json("outputs") or {}).keys())
-    if not names:
-        return "nested session names no output; viewport left alone"
-
+    try:
+        output, mode = _viewport_output(session)
+    except HarnessError as error:
+        return f"{error}; viewport left alone"
+    transform = output["logical"]["transform"]
+    # Mode dimensions are physical and do not shrink after a scale change.
+    # Quarter-turn transforms exchange the axes of the logical viewport.
+    physical_w = mode["height"] if transform in {
+        "90", "270", "Flipped90", "Flipped270",
+    } else mode["width"]
     scale = round(max(0.5, min(4.0, physical_w / width)), 3)
-    session.niri("output", names[0], "scale", str(scale), check=False, timeout=10)
+    result = session.niri("output", output["name"], "scale", str(scale),
+                          check=False, timeout=10)
     time.sleep(0.4)
     try:
-        logical_w, logical_h, _ = output_geometry(session)
+        actual_output, actual_mode = _viewport_output(session, output["name"])
     except HarnessError:
-        return f"scale {scale} applied; nested output stopped reporting geometry"
+        return f"scale {scale} requested; nested output stopped reporting mode geometry"
+    logical = actual_output["logical"]
+    status = "scale request failed; " if result.returncode != 0 else ""
+    if (actual_mode != mode or logical["transform"] != transform):
+        status += "output mode or transform changed during fit; "
     return (
-        f"viewport {logical_w}x{logical_h} logical "
-        f"(framebuffer {physical_w}x{physical_h}, scale {scale})"
+        f"{status}viewport {logical['width']}x{logical['height']} logical "
+        f"(framebuffer {actual_mode['width']}x{actual_mode['height']}, "
+        f"scale {logical['scale']:g}, requested width {width})"
     )
 
 
