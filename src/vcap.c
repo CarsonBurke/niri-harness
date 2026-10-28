@@ -45,11 +45,11 @@ static int64_t now_ms(void) {
 // prepare_read/flush/poll bounds all dispatch, including registry sync. The
 // existing Python capture timeout remains the outer child/reap boundary.
 static bool dispatch(void) {
+  if (failed || now_ms() >= deadline) return false;
   while (wl_display_prepare_read(display) != 0) {
     int count = wl_display_dispatch_pending(display);
-    if (count < 0) return false;
+    if (count < 0 || failed || now_ms() >= deadline) return false;
     if (count > 0) return true;
-    if (now_ms() >= deadline) return false;
   }
   int rc = wl_display_flush(display);
   if (rc < 0 && errno != EAGAIN) {
@@ -70,7 +70,8 @@ static bool dispatch(void) {
   } else {
     wl_display_cancel_read(display);
   }
-  return wl_display_dispatch_pending(display) >= 0;
+  int count = wl_display_dispatch_pending(display);
+  return count >= 0 && !failed && now_ms() < deadline;
 }
 
 static void sync_done(void *data, struct wl_callback *cb, uint32_t serial) {
