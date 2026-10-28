@@ -1383,7 +1383,10 @@ def capture_full_output(session: Session) -> "Image.Image | None":
               if isinstance(row, dict) and row.get("logical") is not None]
     if len(active) != 1:
         return None
-    output, mode = _viewport_output(session, active[0].get("name"))
+    # Do not filter by name: that could hide another newly active output.
+    output, mode = _viewport_output(session)
+    if output != active[0]:
+        raise HarnessError("output changed before full-output capture")
     if output["logical"]["transform"] not in ("Normal", "Flipped180"):
         return None
     if (not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", output["name"])
@@ -1395,7 +1398,7 @@ def capture_full_output(session: Session) -> "Image.Image | None":
     transform = 0 if output["logical"]["transform"] == "Normal" else 6
     result = run([str(VCAP), output["name"], str(mode["width"]), str(mode["height"]),
                   str(transform)], env=session.env, timeout=25)
-    after, _ = _viewport_output(session, output["name"])
+    after, _ = _viewport_output(session)
     if json.dumps(after, sort_keys=True) != before:
         raise HarnessError("output changed during full-output capture")
     return decode_full_output(result.stdout, output, mode)

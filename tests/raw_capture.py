@@ -64,7 +64,10 @@ class Session:
         if arguments != ("outputs",):
             raise AssertionError("capture attempted a non-output IPC operation")
         self.reads += 1
-        return {"winit": copy.deepcopy(self.state)}
+        value = {"winit": copy.deepcopy(self.state)}
+        if hasattr(self, "second_active"):
+            value["other"] = copy.deepcopy(self.second_active)
+        return value
 
 
 class FullOutputCaptureTests(unittest.TestCase):
@@ -158,6 +161,19 @@ class FullOutputCaptureTests(unittest.TestCase):
                 session.state["logical"]["scale"] = 1.5
                 return result
             with patch.object(H, "run", changed_run), self.assertRaises(H.HarnessError):
+                H.capture_frame(session)
+
+            # Keep the original row identical while activating a second row.
+            # Name-filtered before/after checks used to hide this topology change.
+            session.state = output()
+
+            def activated_run(argv, **kwargs):
+                result = fake_run(argv, **kwargs)
+                session.second_active = output()
+                session.second_active["name"] = "other"
+                return result
+
+            with patch.object(H, "run", activated_run), self.assertRaises(H.HarnessError):
                 H.capture_frame(session)
 
     def test_pointer_scale_and_other_capture_layouts_are_preserved(self):
