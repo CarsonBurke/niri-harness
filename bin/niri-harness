@@ -43,6 +43,7 @@ HARNESS_ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = HARNESS_ROOT / "build"
 VPTR = BUILD_DIR / "vptr"
 VKBD = BUILD_DIR / "vkbd"
+VCAP = BUILD_DIR / "vcap"
 NESTED_CONFIG = HARNESS_ROOT / "share" / "nested.kdl"
 A11Y_PROBE = HARNESS_ROOT / "share" / "a11y_probe.py"
 TESSDATA = HARNESS_ROOT / "share" / "tessdata"
@@ -123,12 +124,12 @@ def require_tool(name: str) -> str:
 
 
 def ensure_built() -> None:
-    """Build the input injectors and fetch the OCR model, once, on demand.
+    """Build the input/capture helpers and fetch the OCR model on demand.
 
     A fresh clone carries source and no artefacts, so the first command that
     needs one runs `make` rather than telling the caller to.
     """
-    wanted = (VPTR, VKBD, TESSDATA / "eng.traineddata", TESSDATA / "configs" / "tsv")
+    wanted = (VPTR, VKBD, VCAP, TESSDATA / "eng.traineddata", TESSDATA / "configs" / "tsv")
     missing = [path for path in wanted if not path.exists()]
     if not missing:
         return
@@ -1331,8 +1332,80 @@ def output_geometry(session: Session) -> tuple[int, int, str]:
     raise HarnessError("nested session reports no output geometry")
 
 
+def decode_full_output(payload: bytes, output: dict, mode: dict) -> "Image.Image":
+    """Validate a full SHM frame; never repair a partial raster.
+
+    The client owns the Wayland lifecycle. Format/orientation conversions are
+    lossless pixel permutations, independent of grim's composite canvas.
+    """
+    from PIL import Image
+
+    header, separator, pixels = payload.partition(b"\n")
+    if not separator or len(header) > 1024:
+        raise HarnessError("full-output capture has no bounded header")
+    try:
+        value = json.loads(header)
+    except (ValueError, UnicodeDecodeError) as error:
+        raise HarnessError("invalid full-output capture header") from error
+    keys = {"name", "width", "height", "stride", "format", "transform", "flags"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise HarnessError("unknown full-output capture metadata")
+    transform = {"Normal": 0, "Flipped180": 6}.get(output["logical"]["transform"])
+    width, height = mode["width"], mode["height"]
+    if (transform is None or value["name"] != output["name"]
+            or value["format"] != "XRGB8888LE"
+            or any(type(value[key]) is not int for key in
+                   ("width", "height", "stride", "transform", "flags"))
+            or value["width"] != width or value["height"] != height
+            or value["transform"] != transform
+            or not 0 < width <= 32768 or not 0 < height <= 32768
+            or value["flags"] not in (0, 1)
+            or not width * 4 <= value["stride"] <= width * 4 + 4096
+            or value["stride"] % 4
+            or value["stride"] * height > 64 * 1024 * 1024
+            or len(pixels) != value["stride"] * height):
+        raise HarnessError("full-output capture differs from the selected physical mode")
+    image = Image.frombytes("RGB", (width, height), pixels, "raw", "BGRX", value["stride"], 1)
+    # F180 is a vertical reflection. Buffer YInvert is independent; the two
+    # lossless flips cancel when both are present. No input reflection changes.
+    if bool(value["flags"] & 1) != (transform == 6):
+        image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+    return image
+
+
+def capture_full_output(session: Session) -> "Image.Image | None":
+    """Full physical pixels for one output at the admitted Normal/F180 axes.
+
+    Other transforms/output layouts retain their existing grim path. Once
+    selected, missing tools or bad/changed geometry refuse without fallback.
+    """
+    active = [row for row in outputs(session)
+              if isinstance(row, dict) and row.get("logical") is not None]
+    if len(active) != 1:
+        return None
+    output, mode = _viewport_output(session, active[0].get("name"))
+    if output["logical"]["transform"] not in ("Normal", "Flipped180"):
+        return None
+    if (not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", output["name"])
+            or output["logical"].get("x") != 0 or output["logical"].get("y") != 0):
+        raise HarnessError("full-output capture requires one named output at the origin")
+    before = json.dumps(output, sort_keys=True)
+    if not VCAP.is_file():
+        raise HarnessError("full-output capture helper is missing; run make")
+    transform = 0 if output["logical"]["transform"] == "Normal" else 6
+    result = run([str(VCAP), output["name"], str(mode["width"]), str(mode["height"]),
+                  str(transform)], env=session.env, timeout=25)
+    after, _ = _viewport_output(session, output["name"])
+    if json.dumps(after, sort_keys=True) != before:
+        raise HarnessError("output changed during full-output capture")
+    return decode_full_output(result.stdout, output, mode)
+
+
 def capture_frame(session: Session) -> "Image.Image":
     """Capture one frame without disk I/O or PNG work."""
+    image = capture_full_output(session)
+    if image is not None:
+        return image
     require_tool("grim")
     from PIL import Image
 
@@ -1345,6 +1418,10 @@ def capture_frame(session: Session) -> "Image.Image":
 
 def capture_png(session: Session, path: Path) -> tuple[int, int]:
     """Write a retained PNG directly, without a full frame in Python."""
+    image = capture_full_output(session)
+    if image is not None:
+        save_frame(image, path)
+        return image.size
     require_tool("grim")
     from PIL import Image
 
