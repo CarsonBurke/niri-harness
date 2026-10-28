@@ -145,9 +145,10 @@ class FullOutputCaptureTests(unittest.TestCase):
         with patch.object(H, "VCAP", Tool()), patch.object(H, "run", fake_run), \
                 patch.object(H, "pointer", forbidden), patch.object(H, "keyboard_key", forbidden):
             with tempfile.TemporaryDirectory() as temp:
-                target = Path(temp) / "native.png"
+                target = Path(temp) / "native.dat"
                 self.assertEqual(H.capture_png(session, target), (1278, 800))
                 with Image.open(target) as saved:
+                    self.assertEqual(saved.format, "PNG")
                     self.assertEqual(saved.size, (1278, 800))
                     self.assertEqual(saved.getpixel((1277, 799)), (21, 32, 43))
             self.assertEqual(len(calls), 1)

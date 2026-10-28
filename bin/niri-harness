@@ -1420,7 +1420,8 @@ def capture_png(session: Session, path: Path) -> tuple[int, int]:
     """Write a retained PNG directly, without a full frame in Python."""
     image = capture_full_output(session)
     if image is not None:
-        save_frame(image, path)
+        # The former grim -t png route selected PNG independently of suffix.
+        image.save(path, format="PNG", compress_level=1)
         return image.size
     require_tool("grim")
     from PIL import Image
