@@ -1811,6 +1811,7 @@ def test_a_duration_is_read_the_way_it_is_written() -> None:
             check(f"{text!r} is refused", True)
     check("a duration is reported as it would be written",
           H.describe_duration(5400) == "1h30m", H.describe_duration(5400))
+    check("a sub-second one too", H.describe_duration(0.5) == "0.5s", H.describe_duration(0.5))
 
 
 def fake_render_node(sysfs: Path, name: str, driver: str, vendor: int, device: int) -> None:
@@ -1851,13 +1852,49 @@ def test_the_compositor_renders_on_a_gpu_that_mesa_drives() -> None:
               H.choose_render_device(only_nvidia) is None)
 
 
+# The start of every headless compositor log, verbatim from a real session:
+# warnings about DRI3 and the EGL device are routine and must not read as a
+# renderer failure.
+HEADLESS_LOG_PREAMBLE = """\
+\x1b[2m2026-10-31T21:09:06.268062Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mniri\x1b[0m\x1b[2m:\x1b[0m starting version 26.04 (8ed0da4)
+\x1b[2m2026-10-31T21:09:06.269316Z\x1b[0m \x1b[34mDEBUG\x1b[0m \x1b[2mniri_config\x1b[0m\x1b[2m:\x1b[0m loaded config from "/run/nested.kdl"
+MESA-EGL: warning: DRI3 error: Could not get DRI3 device
+MESA-EGL: warning: Ensure your X server supports DRI3 to get accelerated rendering
+\x1b[2m2026-10-31T21:09:06.578080Z\x1b[0m \x1b[34mDEBUG\x1b[0m \x1b[2mniri::backend::winit\x1b[0m\x1b[2m:\x1b[0m failed building default dmabuf feedback, falling back to v3: error getting EGL device render node
+
+Caused by:
+    None of the following EGL extensions is supported by the underlying EGL implementation, at least one is required: ["EGL_EXT_device_drm"]
+"""
+
+# What niri printed, verbatim, when zink could not create a Vulkan instance.
+ZINK_FAILURE = """\
+\x1b[2m2026-10-31T21:56:46.426017Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mniri\x1b[0m\x1b[2m:\x1b[0m starting version 26.04 (8ed0da4)
+MESA-EGL: warning: DRI3 error: Could not get DRI3 device
+MESA-EGL: warning: Ensure your X server supports DRI3 to get accelerated rendering
+MESA: error: ZINK: vkCreateInstance failed (VK_ERROR_INCOMPATIBLE_DRIVER)
+MESA-EGL: warning: egl: failed to create dri2 screen
+
+thread 'main' (2626746) panicked at src/main.rs:186:6:
+called `Result::unwrap()` on an `Err` value: Egl(InitFailed(NotInitialized))
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+"""
+
+
 def test_only_a_renderer_failure_falls_back_to_software() -> None:
     """A retry in software cures a GPU zink cannot drive and nothing else, so
-    any other failure must be reported as itself."""
-    zink = H.CompositorExited("", "", "MESA: error: ZINK: vkCreateInstance failed")
+    any other failure must be reported as itself - and as its own cause, not
+    as the DRI3 warning every headless start prints."""
+    zink = H.CompositorExited("", H.exit_reason(ZINK_FAILURE, 101), ZINK_FAILURE)
     check("a zink failure is the renderer's", zink.blames_renderer())
-    other = H.CompositorExited("", "", "Error: error binding Wayland socket: address in use")
-    check("another failure is not", not other.blames_renderer())
+    check("and quoted as such", "vkCreateInstance failed" in zink.reason, zink.reason)
+    bind = HEADLESS_LOG_PREAMBLE + (
+        "Error: error binding Wayland socket\n\nCaused by:\n    Address already in use\n"
+    )
+    other = H.CompositorExited("", H.exit_reason(bind, 1), bind)
+    check("another failure is not, routine warnings notwithstanding",
+          not other.blames_renderer())
+    check("and its own cause is quoted", "binding Wayland socket" in other.reason, other.reason)
 
 
 def test_the_application_gets_the_callers_environment_back() -> None:
@@ -1917,6 +1954,8 @@ def test_a_forgotten_session_stops_itself_and_says_why() -> None:
             check("its X server goes with it",
                   wait_until(lambda: H.reaped(session.xvfb_pid), 5.0), str(session.xvfb_pid))
             check("and so does the watchdog", wait_until(lambda: H.reaped(watchdog), 5.0))
+            # Written once the stop is done, so a moment after the compositor goes.
+            wait_until((session.root / "ended").exists, 5.0)
             ended = (session.root / "ended").read_text() if (session.root / "ended").exists() else ""
             check("the reason is recorded", "--idle-timeout of 3s" in ended, repr(ended))
             report = H.dead_session_report([session])
@@ -1947,6 +1986,8 @@ def test_a_session_in_use_outlives_its_idle_timeout_but_not_its_lifetime() -> No
             finally:
                 if held is not None:
                     held.close()
+            # Written once the stop is done, so a moment after the compositor goes.
+            wait_until((session.root / "ended").exists, 5.0)
             ended = (session.root / "ended").read_text() if (session.root / "ended").exists() else ""
             check("the reason names the lifetime", "--max-lifetime of 6s" in ended, repr(ended))
             check("its X server goes with it",
@@ -1973,6 +2014,48 @@ def test_a_compositor_that_dies_does_not_strand_its_x_server() -> None:
                   H.session_file(session.name).exists())
             check("and then exits",
                   wait_until(lambda: H.reaped(session.watchdog_pid), 5.0))
+        finally:
+            H.stop_session(session)
+
+
+def test_restarting_a_dead_session_cleans_up_what_it_left() -> None:
+    """A compositor that dies leaves its X server and its process group
+    behind. Starting again under the same name used to forget the record and
+    strand all of them."""
+    require("niri")
+    require("Xvfb")
+    with tempfile.TemporaryDirectory() as scratch:
+        old = headless_session(
+            "niri-harness-selftest-restart", scratch, idle_timeout=None, max_lifetime=None,
+        )
+        members = [pid for pid in H.process_group(old.pid) if pid != old.pid]
+        os.kill(old.pid, signal.SIGKILL)
+        time.sleep(0.5)
+        new = headless_session(
+            "niri-harness-selftest-restart", scratch, idle_timeout=None, max_lifetime=None,
+        )
+        try:
+            check("the old X server is gone", H.reaped(old.xvfb_pid), str(old.xvfb_pid))
+            check("and so is everything the old compositor started",
+                  not alive(members), str(alive(members)))
+            check("and its watchdog", wait_until(lambda: H.reaped(old.watchdog_pid), 5.0))
+            check("the new session is running", new.alive())
+        finally:
+            H.stop_session(new)
+
+
+def test_a_session_whose_root_is_gone_still_stops() -> None:
+    require("niri")
+    require("Xvfb")
+    with tempfile.TemporaryDirectory() as scratch:
+        session = headless_session(
+            "niri-harness-selftest-rootless", scratch, idle_timeout=2.0, max_lifetime=None,
+        )
+        try:
+            shutil.rmtree(session.root)
+            check("the idle session stops", wait_until(lambda: not session.alive(), 15.0))
+            check("and its X server goes with it",
+                  wait_until(lambda: H.reaped(session.xvfb_pid), 5.0), str(session.xvfb_pid))
         finally:
             H.stop_session(session)
 
@@ -2053,6 +2136,8 @@ def main() -> int:
         test_a_forgotten_session_stops_itself_and_says_why,
         test_a_session_in_use_outlives_its_idle_timeout_but_not_its_lifetime,
         test_a_compositor_that_dies_does_not_strand_its_x_server,
+        test_restarting_a_dead_session_cleans_up_what_it_left,
+        test_a_session_whose_root_is_gone_still_stops,
         test_an_animating_gpu_client_does_not_load_the_compositor,
     ]
     only = sys.argv[1] if len(sys.argv) > 1 else None

@@ -264,15 +264,16 @@ produced blank screenshots through zink in testing and could not take buffers
 from a client rendering on another GPU. If zink cannot start on the GPU it
 picked, the session renders in software and `start` says so, as it does when
 the only GPUs present are ones `auto` skips. With no GPU at all the session
-renders in software.
+renders in software. A start that falls back stays within the one `--timeout`.
 
 `--renderer software` keeps the software path. `--renderer /dev/dri/renderD128`
 names a GPU outright; if zink cannot start on it, `start` fails instead of
 falling back. `--renderer` only affects headless sessions: under `--backend
-window` the host compositor's GPU is used. The renderer's settings apply to
-the compositor only. The
-application keeps your environment and picks its own GPU, as it would on a
-desktop. `list --json` reports what each session renders with.
+window` the host compositor's GPU is used. The renderer's settings are set
+for niri, so the helpers niri starts itself, such as `xwayland-satellite`,
+inherit them too. The application does not: it gets your environment back and
+picks its own GPU, as it would on a desktop. `list --json` reports what each
+session renders with.
 
 ## Lifetime
 
@@ -292,7 +293,8 @@ A session stopped this way is shut down exactly as `stop` would do it. Its
 record stays, so the next command explains what happened instead of saying only
 that there is no session. `stop` then removes the record. The watchdog also
 reaps the session's X server if the compositor exits on its own, which nothing
-else would do.
+else would do. Starting a session again under the name of one that died
+cleans up whatever the dead one left running first.
 
 If you drive the application by some other route, such as a browser's DevTools
 protocol, the harness cannot see that use. Pass a longer `--idle-timeout`, or
@@ -351,7 +353,9 @@ tests/                self-test
 ```
 
 Session records live in `$XDG_RUNTIME_DIR/niri-harness`. Set
-`NIRI_HARNESS_STATE` to use a different directory. A session's root holds
+`NIRI_HARNESS_STATE` to use a different directory. Everything a session starts
+sees `NIRI_HARNESS_ROOT`, the session's root, which is how the harness finds
+those processes again to stop them. A session's root holds
 `session.log` (the application's output, which `logs` reads), `bus.log` (its
 private D-Bus daemon and the services that daemon starts),
 `compositor.log`, `watchdog.log`, `ended` (why the watchdog stopped the
