@@ -26,7 +26,9 @@ screenshot space disagree with pointer space.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -46,10 +48,11 @@ NESTED_CONFIG = HARNESS_ROOT / "share" / "nested.kdl"
 A11Y_PROBE = HARNESS_ROOT / "share" / "a11y_probe.py"
 TESSDATA = HARNESS_ROOT / "share" / "tessdata"
 
+# Absolute, because the session's watchdog runs from / and finds records here.
 STATE_DIR = Path(
     os.environ.get("NIRI_HARNESS_STATE")
     or (Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "niri-harness")
-)
+).resolve()
 
 # Where a session keeps its logs and shots when `start` is not given `--root`.
 # Not the runtime directory the records live in: that is RAM-backed, and a
@@ -80,6 +83,12 @@ STABLE_MAX_DIFF_FRACTION = 0.002
 #   grim -t ppm -s 0.1    114 ms      frame_difference, 0.1 probe    0.6 ms
 #
 # so a probe is simply a capture.
+
+
+# How long a session may run unless `start` says otherwise: an hour after the
+# last command that used it, and half a day in all. See "session lifetime".
+DEFAULT_IDLE_TIMEOUT = 60 * 60.0
+DEFAULT_MAX_LIFETIME = 12 * 60 * 60.0
 
 
 class HarnessError(RuntimeError):
@@ -290,6 +299,20 @@ class Session:
     boot: str | None = None
     # What sizing the nested output ended up with, for the start report only.
     fit: str | None = None
+    # What composites the session: a render node such as "renderD129
+    # (amdgpu)", "software", or "host" for a window session.
+    renderer: str | None = None
+    # Why the renderer is not the one asked for, for the start report only.
+    renderer_note: str | None = None
+    # When the session began, in seconds since the epoch, and how long it may
+    # run: in all, and since the last command that named it. None is no limit.
+    started: float | None = None
+    idle_timeout: float | None = None
+    max_lifetime: float | None = None
+    # The process that ends the session when a limit runs out, identified the
+    # same way as the compositor so that `stop` can never signal a stranger.
+    watchdog_pid: int | None = None
+    watchdog_start: int | None = None
 
     @property
     def env(self) -> dict[str, str]:
@@ -319,9 +342,15 @@ class Session:
         return json.loads(out or b"null")
 
     def alive(self) -> bool:
-        try:
-            os.kill(self.pid, 0)
-        except OSError:
+        """Whether the compositor is running and serving its socket.
+
+        Signal 0 is not enough on its own: a compositor killed outright stays
+        a zombie under a parent that does not reap it, and leaves its socket
+        file behind, so the two together would call it alive indefinitely.
+        """
+        if self.pid_start is not None and not is_recorded_process(self.pid, self.pid_start):
+            return False
+        if process_state(self.pid) in (None, "Z"):
             return False
         return Path(self.socket).exists()
 
@@ -332,7 +361,11 @@ def session_file(name: str) -> Path:
 
 def save_session(session: Session) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    session_file(session.name).write_text(
+    # Replaced rather than rewritten in place: the session's watchdog reads the
+    # record on its own schedule and must never find it half written.
+    final = session_file(session.name)
+    partial = final.with_name(f".{final.name}.partial")
+    partial.write_text(
         json.dumps(
             {
                 "name": session.name,
@@ -346,10 +379,17 @@ def save_session(session: Session) -> None:
                 "pid_start": session.pid_start,
                 "xvfb_start": session.xvfb_start,
                 "boot": session.boot,
+                "renderer": session.renderer,
+                "started": session.started,
+                "idle_timeout": session.idle_timeout,
+                "max_lifetime": session.max_lifetime,
+                "watchdog_pid": session.watchdog_pid,
+                "watchdog_start": session.watchdog_start,
             },
             indent=2,
         )
     )
+    os.replace(partial, final)
 
 def dead_session_report(known: list["Session"]) -> str:
     """Say why there is no session, not merely that there is none.
@@ -368,6 +408,7 @@ def dead_session_report(known: list["Session"]) -> str:
     for session in known[-2:]:
         lines.append(f"session {session.name} pid={session.pid} root={session.root}")
         for label, path, keep in (
+            ("ended", session.root / "ended", 1),
             ("application status", session.root / "session.rc", 1),
             ("compositor", session.root / "compositor.log", 3),
             ("application", session.root / "session.log", 3),
@@ -416,6 +457,12 @@ def session_from_record(data: dict) -> Session:
         pid_start=data.get("pid_start"),
         xvfb_start=data.get("xvfb_start"),
         boot=data.get("boot"),
+        renderer=data.get("renderer"),
+        started=data.get("started"),
+        idle_timeout=data.get("idle_timeout"),
+        max_lifetime=data.get("max_lifetime"),
+        watchdog_pid=data.get("watchdog_pid"),
+        watchdog_start=data.get("watchdog_start"),
     )
 
 
@@ -598,6 +645,153 @@ def headless_scale(width: int) -> float:
     return round(width / WINIT_WINDOW[0], 4)
 
 
+# --------------------------------------------------------------------------
+# the headless renderer
+#
+# Xvfb has no DRI3, so the EGL display niri's winit backend gets from it is
+# Mesa's software rasteriser, llvmpipe. That alone is affordable for a client
+# that also draws in software and hands over shared memory. It is ruinous for
+# one that draws on a GPU - Chromium, anything on Vulkan or wgpu - because
+# such a client hands over dmabufs in GPU memory, and llvmpipe composites them
+# by reading that memory through an uncached CPU mapping. Measured with a
+# 1600x1000 window, one composited frame cost about 0.75 CPU-seconds, so a
+# client with any animation at all, even a spinner, kept 24 llvmpipe threads
+# busy at 500-1300% CPU while it crawled along at 5-10 frames a second.
+#
+# zink - Mesa's OpenGL on Vulkan - needs no DRI3 to render: it draws on the
+# GPU and copies the finished frame into the X server, which costs a few MB
+# per frame instead of a GPU-memory read per texel. The same animated windows
+# then cost 5-30% CPU at full frame rate.
+
+
+@dataclass(frozen=True)
+class RenderDevice:
+    """A GPU the nested compositor can composite on."""
+
+    node: str  # /dev/dri/renderD128
+    driver: str  # the kernel driver: amdgpu, i915, nvidia, ...
+    vendor: int
+    device: int
+
+    @property
+    def select(self) -> str:
+        """How Mesa's Vulkan device-select layer names this GPU."""
+        return f"{self.vendor:04x}:{self.device:04x}"
+
+    def describe(self) -> str:
+        return f"{Path(self.node).name} ({self.driver})"
+
+
+# Kernel drivers that have render nodes but no Vulkan driver behind them.
+NO_VULKAN_DRIVERS = {"vgem", "vkms", "evdi", "udl"}
+
+
+def render_devices(sysfs: Path = Path("/sys/class/drm")) -> list[RenderDevice]:
+    """Every render node with a GPU behind it that Vulkan could drive."""
+    found = []
+    for entry in sorted(sysfs.glob("renderD*")):
+        try:
+            driver = Path(os.readlink(entry / "device" / "driver")).name
+            vendor = int((entry / "device" / "vendor").read_text().strip(), 16)
+            device = int((entry / "device" / "device").read_text().strip(), 16)
+        except (OSError, ValueError):
+            continue
+        if driver in NO_VULKAN_DRIVERS:
+            continue
+        found.append(RenderDevice(f"/dev/dri/{entry.name}", driver, vendor, device))
+    return found
+
+
+# Kernel drivers with a Mesa Vulkan driver behind them, which is what `auto`
+# composites on. NVIDIA's own driver is deliberately not here: with it (615.71)
+# zink started and ran, but every frame the harness captured was a single flat
+# colour, and it refused the amdgpu buffers Chromium handed it, which kills
+# Chromium at startup.
+MESA_VULKAN_DRIVERS = {
+    "amdgpu",  # radv
+    "i915", "xe",  # anv, hasvk
+    "nouveau",  # nvk
+    "msm",  # turnip
+    "panfrost", "panthor",  # panvk
+    "v3d",  # v3dv
+    "asahi",  # honeykrisp
+    "powervr",  # pvr
+    "virtio_gpu",  # venus
+}
+
+
+def choose_render_device(devices: list[RenderDevice]) -> RenderDevice | None:
+    """The GPU to composite on when the caller did not name one, if any.
+
+    Only a GPU that Mesa drives: zink is Mesa's, and Mesa's Vulkan drivers are
+    the ones it is known to work on. They also import other drivers' buffers -
+    radv composited a Vulkan client rendering on the NVIDIA card - which
+    matters because a client picks its GPU without asking the compositor.
+    Among several, the first render node.
+    """
+    usable = [found for found in devices if found.driver in MESA_VULKAN_DRIVERS]
+    return usable[0] if usable else None
+
+
+def resolve_renderer(renderer: str) -> RenderDevice | None:
+    """Turn `--renderer` into a GPU to use, or None for software rendering."""
+    if renderer == "software":
+        return None
+    devices = render_devices()
+    if renderer == "auto":
+        return choose_render_device(devices)
+    node = os.path.realpath(renderer)
+    for found in devices:
+        if os.path.realpath(found.node) == node:
+            return found
+    known = ", ".join(found.node for found in devices) or "none found"
+    raise HarnessError(
+        f"--renderer {renderer!r} is not a render node with a GPU behind it"
+        f" (render nodes: {known}); pass auto, software, or one of those"
+    )
+
+
+def renderer_environment(device: RenderDevice) -> dict[str, str]:
+    """What makes the nested compositor's EGL composite on `device`."""
+    return {
+        "GALLIUM_DRIVER": "zink",
+        # Without these zink takes whichever GPU it ranks first, which need not
+        # be the one chosen above.
+        "MESA_VK_DEVICE_SELECT": device.select,
+        "MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE": "1",
+    }
+
+
+# Caller variables that would decide the compositor's renderer instead of the
+# harness. Cleared for it; the application gets the caller's values back.
+RENDERER_ENVIRONMENT = (
+    "GALLIUM_DRIVER",
+    "MESA_VK_DEVICE_SELECT",
+    "MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE",
+    "LIBGL_ALWAYS_SOFTWARE",
+    "MESA_LOADER_DRIVER_OVERRIDE",
+)
+
+
+# Variables the harness sets for the nested compositor alone. The application
+# inherits the compositor's environment, and these must not reach it:
+# WINIT_X11_SCALE_FACTOR would scale any winit application, and the renderer's
+# variables would move the application's own OpenGL onto zink and hide every
+# GPU but one from its Vulkan.
+COMPOSITOR_ONLY_ENVIRONMENT = ("WINIT_X11_SCALE_FACTOR", *RENDERER_ENVIRONMENT)
+
+
+def restore_caller_environment() -> str:
+    """Shell lines that give the application the caller's values back."""
+    lines = []
+    for key in COMPOSITOR_ONLY_ENVIRONMENT:
+        if key in os.environ:
+            lines.append(f"export {key}={shell_quote(os.environ[key])}\n")
+        else:
+            lines.append(f"unset {key}\n")
+    return "".join(lines)
+
+
 def start_xvfb(root: Path, framebuffer: tuple[int, int]) -> tuple[subprocess.Popen, str]:
     """Start a private X server for one session, and say which display it took.
 
@@ -663,6 +857,18 @@ def start_xvfb(root: Path, framebuffer: tuple[int, int]) -> tuple[subprocess.Pop
             proc.wait(timeout=5)
         raise HarnessError("Xvfb did not report a display number within 20s")
     return proc, f":{number.strip().decode()}"
+
+
+def process_state(pid: int) -> str | None:
+    """A process's state letter from /proc, or None if there is no such process.
+
+    Unlike `reaped`, this never collects a zombie: a zombie leader is what
+    keeps its process group attributable to the session it led.
+    """
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return None
 
 
 def reaped(pid: int) -> bool:
@@ -738,7 +944,191 @@ def stop_xvfb(session: Session) -> None:
             time.sleep(0.05)
 
 
-def start_session(
+class CompositorExited(HarnessError):
+    """The nested compositor died before it handed back its environment."""
+
+    def __init__(self, message: str, reason: str, log: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.log = log
+
+    def blames_renderer(self) -> bool:
+        """Whether the compositor died setting up its renderer, which is the
+        one failure a software retry can cure."""
+        return renderer_failure(self.log) is not None
+
+
+# How a renderer that cannot start shows in niri's log. Only failures: every
+# headless start also logs DRI3 and EGL-device warnings, which are routine.
+RENDERER_FAILURES = re.compile(
+    r"ZINK: .*failed|failed to create dri2 screen|Egl\(InitFailed|"
+    r"error creating renderer|failed to initialize EGL",
+    re.I,
+)
+
+
+def renderer_failure(log: str) -> str | None:
+    """The line of a compositor log that says its renderer failed, if one does."""
+    for line in log.splitlines():
+        if RENDERER_FAILURES.search(line):
+            return line.strip()
+    return None
+
+
+def exit_reason(log: str, returncode: int) -> str:
+    """The line most likely to say why the compositor exited."""
+    found = renderer_failure(log)
+    if found:
+        return found
+    for line in reversed(log.splitlines()):
+        lowered = line.lower()
+        if ("error" in lowered or "panicked" in lowered) and not (
+            "warning" in lowered or "debug" in lowered
+        ):
+            return line.strip()
+    return f"exit status {returncode}"
+
+
+@dataclass
+class LaunchedCompositor:
+    proc: subprocess.Popen
+    pid_start: int | None
+    xvfb: subprocess.Popen | None
+    x_display: str | None
+    xvfb_start: int | None
+    boot: str | None
+    display: str
+    socket: str
+    # When the start runs out of time: `--timeout` counts from the moment the
+    # X server is up, so a slow X server does not eat the application's time.
+    deadline: float
+
+
+def launch_compositor(
+    root: Path,
+    session_config: Path,
+    launcher: Path,
+    handshake: Path,
+    *,
+    backend: str,
+    width: int | None,
+    device: RenderDevice | None,
+    timeout: float,
+) -> LaunchedCompositor:
+    """Start the nested compositor, and its X server when headless, and wait
+    for the launcher inside it to report the session's environment."""
+    # What the launcher writes. A previous attempt's must not be read as this
+    # one's: a retry would hand back a dead compositor's socket.
+    for stale in (handshake, root / "session.rc", root / "session.bus"):
+        stale.unlink(missing_ok=True)
+    niri_env = dict(os.environ)
+    xvfb: subprocess.Popen | None = None
+    x_display: str | None = None
+    if backend == "headless":
+        scale = headless_scale(width) if width else 1.0
+        framebuffer = (
+            round(WINIT_WINDOW[0] * scale),
+            round(WINIT_WINDOW[1] * scale),
+        )
+        xvfb, x_display = start_xvfb(root, framebuffer)
+        # niri chooses its winit backend from the environment: a Wayland
+        # display if it is given one, an X display otherwise. It must find
+        # ours and not the caller's, or the session draws on their desktop.
+        niri_env.pop("WAYLAND_DISPLAY", None)
+        niri_env.pop("NIRI_SOCKET", None)
+        niri_env["DISPLAY"] = x_display
+        niri_env["WINIT_X11_SCALE_FACTOR"] = str(scale)
+        for key in RENDERER_ENVIRONMENT:
+            niri_env.pop(key, None)
+        niri_env.update(
+            renderer_environment(device) if device else {"GALLIUM_DRIVER": "llvmpipe"}
+        )
+    deadline = time.monotonic() + timeout
+
+    # The nested compositor's own output goes to a file, not to DEVNULL: when it
+    # dies mid-run the application only reports "Connection reset by peer", and
+    # without this log there is nothing left to say why the compositor went away.
+    compositor_log = root / "compositor.log"
+    boot = boot_id()
+    xvfb_start = process_start(xvfb.pid) if xvfb else None
+    with compositor_log.open("ab") as sink:
+        proc = subprocess.Popen(
+            ["niri", "-c", str(session_config), "--", str(launcher)],
+            env=niri_env,
+            stdout=sink,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid_start = process_start(proc.pid)
+
+    def abandon() -> None:
+        """Take the whole session down before reporting why it did not start.
+
+        The X server is not the compositor's child, so nothing else will reap
+        it, and a leaked one holds its display number for the life of the login
+        session.
+        """
+        sweep_process_group(proc.pid, root, boot, pid_start)
+        if xvfb is not None and xvfb.poll() is None:
+            # This one is the harness's own child and needs no attributing,
+            # but it does need a second signal: an X server that ignores the
+            # first would hold its display number for the life of the login.
+            xvfb.terminate()
+            try:
+                xvfb.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                xvfb.kill()
+                xvfb.wait(timeout=2.0)
+
+    while time.monotonic() < deadline:
+        if handshake.exists():
+            text = handshake.read_text()
+            display = re.search(r"WAYLAND_DISPLAY=(\S+)", text)
+            socket = re.search(r"NIRI_SOCKET=(\S+)", text)
+            if display and socket:
+                return LaunchedCompositor(
+                    proc=proc, pid_start=pid_start, xvfb=xvfb, x_display=x_display,
+                    xvfb_start=xvfb_start, boot=boot,
+                    display=display.group(1), socket=socket.group(1),
+                    deadline=deadline,
+                )
+        if proc.poll() is not None:
+            abandon()
+            tail = log_tail(compositor_log, 15)
+            whole = compositor_log.read_text(errors="replace") if compositor_log.exists() else ""
+            raise CompositorExited(
+                f"nested niri exited with {proc.returncode} before handshake; "
+                f"see {compositor_log}:\n{tail}",
+                exit_reason(whole, proc.returncode),
+                whole,
+            )
+        if xvfb is not None and xvfb.poll() is not None:
+            abandon()
+            raise HarnessError(
+                f"the session's X server exited with {xvfb.returncode}; "
+                f"see {root / 'xvfb.log'}:\n{log_tail(root / 'xvfb.log', 10)}"
+            )
+        time.sleep(0.1)
+    abandon()
+    raise HarnessError(
+        f"nested niri did not hand back its environment within {timeout:g}s;"
+        f" see {compositor_log}"
+    )
+
+
+def start_session(name: str, command: str, *, root: Path, **options) -> Session:
+    """Start a session, marked in use until it is up so that its watchdog
+    cannot take a slow start for an idle session. The root is made absolute:
+    the watchdog runs from / and finds the session's files through it."""
+    held = hold_session(name)
+    try:
+        return launch_session(name, command, root=Path(root).resolve(), **options)
+    finally:
+        if held is not None:
+            held.close()
+
+
+def launch_session(
     name: str,
     command: str,
     *,
@@ -750,6 +1140,9 @@ def start_session(
     width: int | None = 1600,
     backend: str = "headless",
     host_bus: bool = False,
+    renderer: str = "auto",
+    idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
+    max_lifetime: float | None = DEFAULT_MAX_LIFETIME,
 ) -> Session:
     ensure_built()
     require_tool("niri")
@@ -771,7 +1164,13 @@ def start_session(
             raise HarnessError(
                 f"session {name!r} is already live (pid {previous.pid}); stop it first"
             )
-        existing.unlink()
+        # Cleaned up, not merely forgotten: a compositor that died leaves its
+        # X server, its application and its bus running, and once the record
+        # is gone nothing knows they are there. Every signal is checked against
+        # the start times the record carries. The usage lock stays: this
+        # start is holding it.
+        stop_session(previous, forget=False)
+        existing.unlink(missing_ok=True)
 
     root.mkdir(parents=True, exist_ok=True)
     # A root outlives its session, and the default one is reused by every
@@ -781,7 +1180,7 @@ def start_session(
     # against a previous run's screen it would click without complaint.
     for stale in (
         "session.log", "compositor.log", "xvfb.log", "a11y.log", "bus.log",
-        "observed.json", "shots/_observed.png",
+        "watchdog.log", "ended", "observed.json", "shots/_observed.png",
     ):
         (root / stale).unlink(missing_ok=True)
     handshake = root / "session.env"
@@ -805,10 +1204,8 @@ def start_session(
     launcher.write_text(
         "#!/bin/sh\n"
         "# Written by niri-harness. Runs inside the nested compositor.\n"
-        # This sizes the compositor's own winit window under the headless
-        # backend. Left set, it would be inherited by any winit application in
-        # the session and scale that too.
-        "unset WINIT_X11_SCALE_FACTOR\n"
+        f"{restore_caller_environment()}"
+        f"export {SESSION_ROOT_VARIABLE}={shell_quote(str(root))}\n"
         f"printf 'WAYLAND_DISPLAY=%s\\nNIRI_SOCKET=%s\\n' "
         f'"$WAYLAND_DISPLAY" "$NIRI_SOCKET" > {shell_quote(str(handshake))}\n'
         f"{exports}\n"
@@ -832,9 +1229,6 @@ def start_session(
     # what it maps. A headless session has no window and nothing to give back.
     previous_focus = host_focused_window() if backend == "window" else None
 
-    niri_env = dict(os.environ)
-    xvfb: subprocess.Popen | None = None
-    x_display: str | None = None
     if backend == "headless":
         low, high = HEADLESS_WIDTH_RANGE
         if width is not None and not low <= width <= high:
@@ -844,110 +1238,101 @@ def start_session(
                 f" because a width this far outside the useful ones is far more"
                 f" likely to be a mistake than an intention"
             )
-        scale = headless_scale(width) if width else 1.0
-        framebuffer = (
-            round(WINIT_WINDOW[0] * scale),
-            round(WINIT_WINDOW[1] * scale),
+    # Only the headless backend renders in software otherwise. A window
+    # session's EGL comes from the host compositor, which already has a GPU.
+    device = resolve_renderer(renderer) if backend == "headless" else None
+    renderer_note: str | None = None
+    if backend == "window" and renderer != "auto":
+        renderer_note = (
+            f"--renderer {renderer} ignored: a window session renders with the"
+            f" host compositor's GPU"
         )
-        xvfb, x_display = start_xvfb(root, framebuffer)
-        # niri chooses its winit backend from the environment: a Wayland
-        # display if it is given one, an X display otherwise. It must find
-        # ours and not the caller's, or the session draws on their desktop.
-        niri_env.pop("WAYLAND_DISPLAY", None)
-        niri_env.pop("NIRI_SOCKET", None)
-        niri_env["DISPLAY"] = x_display
-        niri_env["WINIT_X11_SCALE_FACTOR"] = str(scale)
-
-    # The nested compositor's own output goes to a file, not to DEVNULL: when it
-    # dies mid-run the application only reports "Connection reset by peer", and
-    # without this log there is nothing left to say why the compositor went away.
-    compositor_log = root / "compositor.log"
-    boot = boot_id()
-    xvfb_start = process_start(xvfb.pid) if xvfb else None
-    with compositor_log.open("ab") as sink:
-        proc = subprocess.Popen(
-            ["niri", "-c", str(session_config), "--", str(launcher)],
-            env=niri_env,
-            stdout=sink,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+    if backend == "headless":
+        if device is not None and device.driver not in MESA_VULKAN_DRIVERS:
+            renderer_note = (
+                f"{device.describe()} is not driven by Mesa, and zink has"
+                f" rendered blank frames on such a GPU; check a screenshot"
+                f" before trusting this session"
+            )
+        elif device is None and renderer == "auto" and render_devices():
+            renderer_note = (
+                "rendering in software: no GPU here that zink composites on"
+                " reliably, so windows a client draws on its GPU are slow"
+            )
+    began = time.monotonic()
+    try:
+        launched = launch_compositor(
+            root, session_config, launcher, handshake,
+            backend=backend, width=width, device=device, timeout=timeout,
         )
-    pid_start = process_start(proc.pid)
+    except CompositorExited as failure:
+        if renderer != "auto" or device is None or not failure.blames_renderer():
+            raise
+        # The retry shares the start's `--timeout` rather than getting its own.
+        remaining = timeout - (time.monotonic() - began)
+        if remaining <= 0:
+            raise
+        # zink panics niri at startup when Vulkan cannot drive the GPU it was
+        # given. A session that renders slowly beats no session, so `auto`
+        # tries again in software and says so; a GPU the caller named fails.
+        renderer_note = (
+            f"{device.describe()} could not composite ({failure.reason});"
+            f" rendering in software, which is slow for GPU clients"
+        )
+        device = None
+        launched = launch_compositor(
+            root, session_config, launcher, handshake,
+            backend=backend, width=width, device=None, timeout=remaining,
+        )
+    deadline = launched.deadline
 
-    def abandon(message: str) -> HarnessError:
-        """Take the whole session down before reporting why it did not start.
-
-        The X server is not the compositor's child, so nothing else will reap
-        it, and a leaked one holds its display number for the life of the login
-        session.
-        """
-        sweep_process_group(proc.pid, root, boot, pid_start)
-        if xvfb is not None and xvfb.poll() is None:
-            # This one is the harness's own child and needs no attributing,
-            # but it does need a second signal: an X server that ignores the
-            # first would hold its display number for the life of the login.
-            xvfb.terminate()
-            try:
-                xvfb.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                xvfb.kill()
-                xvfb.wait(timeout=2.0)
-        return HarnessError(message)
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if handshake.exists():
-            text = handshake.read_text()
-            display = re.search(r"WAYLAND_DISPLAY=(\S+)", text)
-            socket = re.search(r"NIRI_SOCKET=(\S+)", text)
-            if display and socket:
-                session = Session(
-                    name=name,
-                    display=display.group(1),
-                    socket=socket.group(1),
-                    pid=proc.pid,
-                    root=root,
-                    backend=backend,
-                    x_display=x_display,
-                    xvfb_pid=xvfb.pid if xvfb else None,
-                    pid_start=pid_start,
-                    xvfb_start=xvfb_start,
-                    boot=boot,
-                )
-                save_session(session)
-                # The handshake proves the compositor is up, not the
-                # application: the launcher writes it first, so a command that
-                # does not exist still gets this far. A session whose
-                # application never appeared is a failed start, and it must not
-                # stay registered as live - `Session.alive()` watches the
-                # compositor, which outlives its dead client quite happily.
-                if expect_window:
-                    try:
-                        await_application(session, status, deadline)
-                    except HarnessError as error:
-                        stop_session(session)
-                        raise HarnessError(str(error)) from None
-                    session.fit = describe_viewport(session, width)
-                # The host focuses a newly mapped window, and this one is the
-                # harness's, not the caller's. Give it back - and do it whether
-                # or not the application was waited for, because the window
-                # that took the focus is the compositor's own.
-                returned = restore_host_focus(previous_focus)
-                if returned:
-                    session.fit = f"{session.fit + '; ' if session.fit else ''}{returned}"
-                return session
-        if proc.poll() is not None:
-            raise abandon(
-                f"nested niri exited with {proc.returncode} before handshake; "
-                f"see {compositor_log}:\n{log_tail(compositor_log, 15)}"
-            )
-        if xvfb is not None and xvfb.poll() is not None:
-            raise abandon(
-                f"the session's X server exited with {xvfb.returncode}; "
-                f"see {root / 'xvfb.log'}:\n{log_tail(root / 'xvfb.log', 10)}"
-            )
-        time.sleep(0.1)
-    raise abandon(f"nested niri did not hand back its environment within {timeout:g}s")
+    session = Session(
+        name=name,
+        display=launched.display,
+        socket=launched.socket,
+        pid=launched.proc.pid,
+        root=root,
+        backend=backend,
+        x_display=launched.x_display,
+        xvfb_pid=launched.xvfb.pid if launched.xvfb else None,
+        pid_start=launched.pid_start,
+        xvfb_start=launched.xvfb_start,
+        boot=launched.boot,
+        renderer=(
+            device.describe() if device else "software" if backend == "headless" else "host"
+        ),
+        started=time.time(),
+        idle_timeout=idle_timeout,
+        max_lifetime=max_lifetime,
+    )
+    session.renderer_note = renderer_note
+    save_session(session)
+    # Spawned before the application is waited for, not after: a caller that
+    # gives up on `start` part way through still leaves a session that ends.
+    spawn_watchdog(session)
+    # The handshake proves the compositor is up, not the application: the
+    # launcher writes it first, so a command that does not exist still gets
+    # this far. A session whose application never appeared is a failed start,
+    # and it must not stay registered as live - `Session.alive()` watches the
+    # compositor, which outlives its dead client quite happily.
+    if expect_window:
+        try:
+            await_application(session, status, deadline)
+        except HarnessError as error:
+            stop_session(session)
+            raise HarnessError(str(error)) from None
+        session.fit = describe_viewport(session, width)
+    # The host focuses a newly mapped window, and this one is the harness's,
+    # not the caller's. Give it back - and do it whether or not the application
+    # was waited for, because the window that took the focus is the
+    # compositor's own.
+    returned = restore_host_focus(previous_focus)
+    if returned:
+        session.fit = f"{session.fit + '; ' if session.fit else ''}{returned}"
+    # Starting is using: the idle clock runs from here, not from the moment
+    # the record was first written, or a slow start would eat into it.
+    touch_session(session)
+    return session
 
 
 def describe_viewport(session: Session, width: int | None) -> str | None:
@@ -1071,6 +1456,22 @@ def names_root(cmdline: str, root: Path) -> bool:
     return False
 
 
+# Exported by the launcher to everything the session starts, so that a process
+# whose command line says nothing about the session - the application itself,
+# `exec`ed by name - can still be attributed once the compositor is gone.
+SESSION_ROOT_VARIABLE = "NIRI_HARNESS_ROOT"
+
+
+def environment_names_root(pid: int, root: Path) -> bool:
+    """Whether a process inherited this session's root from its launcher."""
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    wanted = {f"{SESSION_ROOT_VARIABLE}={path}".encode() for path in (root, root.resolve())}
+    return any(entry in wanted for entry in environ.split(b"\0"))
+
+
 def leader_is_ours(pid: int, root: Path) -> bool:
     """Whether the live process `pid` is this session's own compositor.
 
@@ -1159,7 +1560,7 @@ def sweep_process_group(
         cmdline = process_cmdline(member)
         if not cmdline:
             continue
-        if names_root(cmdline, root):
+        if names_root(cmdline, root) or environment_names_root(member, root):
             signal_process(member)
         elif Path(cmdline.split("\0", 1)[0]).name in ACCESSIBILITY_STRAYS:
             if start is not None:
@@ -1210,7 +1611,7 @@ def signal_group(pid: int) -> None:
             time.sleep(0.05)
 
 
-def stop_session(session: Session, *, timeout: float = 10.0) -> str:
+def stop_session(session: Session, *, timeout: float = 10.0, forget: bool = True) -> str:
     """End a session and everything it owns.
 
     Asking the compositor to quit is only the first half. It takes its own
@@ -1223,11 +1624,17 @@ def stop_session(session: Session, *, timeout: float = 10.0) -> str:
     compositor - it has to outlive a compositor crash for the log to survive -
     so it is reaped separately, after the group rather than with it: its
     clients should lose their windows before they lose their display.
+
+    `forget=False` keeps the record, so that the next command can say why the
+    session is gone; the watchdog uses it when a limit runs out.
     """
     try:
         if not session.alive():
             return "already stopped"
-        session.niri("action", "quit", "--skip-confirmation", check=False, timeout=5)
+        try:
+            session.niri("action", "quit", "--skip-confirmation", check=False, timeout=5)
+        except subprocess.TimeoutExpired:
+            pass  # A hung compositor; the sweep below takes it down instead.
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if not session.alive():
@@ -1239,7 +1646,267 @@ def stop_session(session: Session, *, timeout: float = 10.0) -> str:
             session.pid, session.root, session.boot, session.pid_start
         )
         stop_xvfb(session)
-        session_file(session.name).unlink(missing_ok=True)
+        stop_watchdog(session)
+        if forget:
+            session_file(session.name).unlink(missing_ok=True)
+            usage_lock(session.name).unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------
+# session lifetime
+#
+# A session nobody stops runs until logout: `start` returns, and nothing else
+# is watching. Each session therefore gets a small watchdog process that stops
+# it when it has gone unused for too long or has simply run too long, and that
+# reaps the X server when the compositor dies on its own, which nothing else
+# would. "Unused" means that no niri-harness command has named the session:
+# every command that resolves a session marks it used. A tool that drives the
+# application some other way - over a debugging protocol, say - should pass a
+# longer `--idle-timeout`, or 0 for none, and rely on `--max-lifetime`.
+
+# How often the watchdog looks at its session when no limit is due sooner. It
+# only reads a record and two /proc entries, so this is about how soon a dead
+# compositor's X server is reaped.
+WATCHDOG_POLL = 15.0
+
+DURATION_UNITS = {"h": 3600.0, "m": 60.0, "s": 1.0}
+
+
+def parse_duration(text: str) -> float | None:
+    """Seconds in `90s`, `30m`, `1h30m` or a bare number of seconds.
+
+    `0`, `off` and `none` all mean no limit, which is returned as None.
+    """
+    value = text.strip().lower()
+    if value in ("0", "off", "none"):
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        if not re.fullmatch(r"(?:\d+(?:\.\d+)?[hms])+", value):
+            raise HarnessError(
+                f"bad duration {text!r}; expected e.g. 90s, 30m, 1h30m, or 0 for none"
+            ) from None
+        seconds = sum(
+            float(amount) * DURATION_UNITS[unit]
+            for amount, unit in re.findall(r"(\d+(?:\.\d+)?)([hms])", value)
+        )
+    if not math.isfinite(seconds) or seconds < 0:
+        raise HarnessError(f"bad duration {text!r}; it must be a finite length of time")
+    return seconds or None
+
+
+def describe_duration(seconds: float) -> str:
+    """`1h30m`, `45m`, `20s`: the shortest exact spelling of a duration."""
+    if seconds < 1:
+        return f"{seconds:g}s"
+    whole = round(seconds)
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = [f"{hours}h" if hours else "", f"{minutes}m" if minutes else "",
+             f"{secs}s" if secs else ""]
+    return "".join(parts) or "0s"
+
+
+def usage_lock(name: str) -> Path:
+    return STATE_DIR / f".{name}.in-use"
+
+
+def hold_session(name: str):
+    """Mark the session in use for as long as the returned file stays open.
+
+    A shared lock, so commands never wait for one another. The watchdog takes
+    the lock exclusively to stop an idle session, so a command that arrives
+    while it does waits for the stop to finish and then finds the session
+    gone, rather than being cut off half way. The kernel drops the lock when
+    its holder exits, however that happens, so a crashed command cannot pin a
+    session forever.
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        handle = usage_lock(name).open("a")
+    except OSError:
+        return None
+    fcntl.flock(handle, fcntl.LOCK_SH)
+    return handle
+
+
+def claim_idle_session(name: str):
+    """The session's lock held exclusively, or None while a command holds it."""
+    try:
+        # Created only alongside a record: a `stop` that has just removed
+        # both must not see the lock come back.
+        if not session_file(name).exists():
+            return None
+        handle = usage_lock(name).open("a")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def touch_session(session: Session) -> None:
+    """Record that a command used the session, which resets its idle timeout.
+
+    The record's modification time is the mark, so using a session costs no
+    write and cannot race the watchdog reading it.
+    """
+    try:
+        os.utime(session_file(session.name))
+    except OSError:
+        pass
+
+
+def spawn_watchdog(session: Session) -> None:
+    """Start the process that ends `session` when a limit runs out."""
+    log = (session.root / "watchdog.log").open("ab")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "_watchdog", session.name],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            # Its own session, so that it is in neither the caller's process
+            # group, which a terminal's Ctrl-C would take down, nor the
+            # compositor's, which stopping the session sweeps.
+            start_new_session=True,
+            # Nowhere in particular, so that it never pins the caller's
+            # directory, which may be a build tree about to be removed.
+            cwd="/",
+            env={**os.environ, "NIRI_HARNESS_STATE": str(STATE_DIR)},
+        )
+    finally:
+        log.close()
+    session.watchdog_pid = proc.pid
+    session.watchdog_start = process_start(proc.pid)
+    save_session(session)
+
+
+def stop_watchdog(session: Session) -> None:
+    """End the session's watchdog, unless that is who is asking."""
+    pid = session.watchdog_pid
+    if not pid or pid == os.getpid():
+        return
+    if session.boot is not None and session.boot != boot_id():
+        return
+    if is_recorded_process(pid, session.watchdog_start):
+        signal_process(pid)
+
+
+def compositor_running(session: Session) -> bool:
+    """Whether the recorded compositor is still running: not gone, not reissued
+    to another process, and not a zombie."""
+    if not is_recorded_process(session.pid, session.pid_start):
+        return False
+    return not reaped(session.pid)
+
+
+def lifetime_reason(session: Session, now: float) -> str | None:
+    """Why the session has run long enough, if it has."""
+    if session.max_lifetime and session.started is not None:
+        if now - session.started >= session.max_lifetime:
+            return (
+                f"stopped by its watchdog after running for its"
+                f" --max-lifetime of {describe_duration(session.max_lifetime)}"
+            )
+    return None
+
+
+def idle_reason(session: Session, now: float, last_used: float) -> str | None:
+    """Why the session has gone unused long enough, if it has."""
+    if session.idle_timeout and now - last_used >= session.idle_timeout:
+        return (
+            f"stopped by its watchdog after no niri-harness command used it for"
+            f" its --idle-timeout of {describe_duration(session.idle_timeout)}"
+        )
+    return None
+
+
+def end_session(session: Session, reason: str) -> None:
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {reason}", flush=True)
+    stop_session(session, forget=False)
+    # Recorded after the stop and only if it can be: the root may have been
+    # removed, and the session must end regardless.
+    try:
+        (session.root / "ended").write_text(reason + "\n")
+    except OSError:
+        pass
+
+
+def next_check(session: Session, now: float, last_used: float) -> float:
+    """Seconds until the watchdog should look again."""
+    due = [WATCHDOG_POLL]
+    if session.max_lifetime and session.started is not None:
+        due.append(session.started + session.max_lifetime - now)
+    if session.idle_timeout:
+        due.append(last_used + session.idle_timeout - now)
+    return max(0.2, min(due))
+
+
+def watch_session(name: str) -> int:
+    """The watchdog's loop: end the session when it is due, then exit.
+
+    It exits on its own as soon as the session it was started for is gone or
+    has been replaced by another of the same name, so it never acts on a
+    session it does not belong to.
+    """
+    record = session_file(name)
+    try:
+        mine = session_from_record(json.loads(record.read_text()))
+    except (OSError, ValueError, KeyError):
+        return 0
+    while True:
+        try:
+            last_used = record.stat().st_mtime
+            session = session_from_record(json.loads(record.read_text()))
+        except (OSError, ValueError, KeyError):
+            session = None
+        if session is None or (session.pid, session.pid_start) != (mine.pid, mine.pid_start):
+            # Stopped, or replaced by a newer session of the same name. Either
+            # way its processes are no longer anybody's to clean up but this
+            # one's; after a `stop` there is nothing left, and every signal
+            # is checked against the start times recorded for them.
+            stop_session(mine, forget=False)
+            return 0
+        if not compositor_running(session):
+            # The compositor went away on its own. Its X server is not its
+            # child and would otherwise run until logout; the record stays,
+            # so the next command can still say what happened.
+            sweep_process_group(session.pid, session.root, session.boot, session.pid_start)
+            stop_xvfb(session)
+            return 0
+        now = time.time()
+        # The lifetime is a hard limit: it ends the session even in use.
+        reason = lifetime_reason(session, now)
+        if reason:
+            end_session(session, reason)
+            return 0
+        if idle_reason(session, now, last_used):
+            claim = claim_idle_session(name)
+            if claim is None:
+                # A command that runs longer than the idle timeout - a long
+                # `wait` - is still use, and the session must not go from
+                # under it.
+                last_used = now
+            else:
+                # Held through the stop, so that no command can begin in
+                # between deciding the session is idle and stopping it. The
+                # record is read again under the lock: a command may have
+                # finished, and marked the session used, since it was read.
+                with claim:
+                    try:
+                        last_used = record.stat().st_mtime
+                    except OSError:
+                        return 0
+                    reason = idle_reason(session, time.time(), last_used)
+                    if reason:
+                        end_session(session, reason)
+                        return 0
+        time.sleep(next_check(session, time.time(), last_used))
 
 
 # --------------------------------------------------------------------------
@@ -2935,6 +3602,31 @@ def build_parser() -> argparse.ArgumentParser:
         choices=sorted(PORTAL_BACKENDS),
         help="run on a private bus so portal dialogs appear inside the session",
     )
+    start.add_argument(
+        "--renderer",
+        default="auto",
+        metavar="auto|software|NODE",
+        help=(
+            "what the headless compositor composites with. auto (the default)"
+            " uses a GPU through zink when there is one and software otherwise;"
+            " NODE names a render node such as /dev/dri/renderD128"
+        ),
+    )
+    start.add_argument(
+        "--idle-timeout",
+        default=describe_duration(DEFAULT_IDLE_TIMEOUT),
+        metavar="DURATION",
+        help=(
+            "stop the session once no niri-harness command has used it for this"
+            " long, e.g. 30m or 2h; 0 for never (default: %(default)s)"
+        ),
+    )
+    start.add_argument(
+        "--max-lifetime",
+        default=describe_duration(DEFAULT_MAX_LIFETIME),
+        metavar="DURATION",
+        help="stop the session this long after it started; 0 for never (default: %(default)s)",
+    )
     start.add_argument("--env", action="append", default=[], metavar="K=V")
     start.add_argument("--timeout", type=float, default=40.0)
     start.add_argument(
@@ -3019,14 +3711,30 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments[:1] == ["_watchdog"] and len(arguments) == 2:
+        # Internal: the process `start` leaves behind to end the session.
+        return watch_session(arguments[1])
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
+    session: Session | None = None
+    in_use = None
 
     try:
         if args.command in SESSION_COMMANDS:
             return SESSION_COMMANDS[args.command](args)
 
         session = load_session(args.session)
+        # Claimed before the session is checked, so the watchdog cannot stop
+        # it between the check and the command.
+        in_use = hold_session(session.name)
+        # A session's log is worth reading after it has gone; nothing else is
+        # worth attempting against one, and the error would only say that the
+        # socket is missing rather than why.
+        reading = args.command == "logs"
+        if not reading and not session.alive():
+            raise HarnessError(dead_session_report([session]))
+        touch_session(session)
         do_heal = not args.no_heal
 
         if args.command == "observe":
@@ -3055,7 +3763,7 @@ def main(argv: list[str] | None = None) -> int:
             emit(payload, text, as_json=args.json)
             return 0
 
-        if do_heal:
+        if do_heal and not reading:
             heal(session, window_match=args.window)
 
         if args.command == "click":
@@ -3240,6 +3948,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except KeyboardInterrupt:
         return 130
+    finally:
+        # A command is use for as long as it runs, so the idle clock restarts
+        # when it finishes too: `wait` may run for minutes.
+        if session is not None:
+            touch_session(session)
+            if in_use is not None:
+                in_use.close()
 
     parser.error(f"unhandled command {args.command!r}")
     return 2
@@ -3291,17 +4006,16 @@ def start_command(args) -> int:
         if not args.width.strip().isdigit():
             raise HarnessError(f"bad --width {args.width!r}; expected pixels or 'host'")
         width = int(args.width)
-    root = Path(args.root).expanduser().resolve() if args.root else DEFAULT_ROOTS / name
+    idle_timeout = parse_duration(args.idle_timeout)
+    max_lifetime = parse_duration(args.max_lifetime)
+    root = (Path(args.root).expanduser() if args.root else DEFAULT_ROOTS / name).resolve()
     # Run where the caller is, so `start ./target/debug/app` means what it
     # says. The `cd` is part of the command rather than the launcher so that a
     # directory that has gone away fails the start with its reason in the log.
     command = f"cd {shell_quote(os.getcwd())} && exec " + " ".join(
         shell_quote(arg) for arg in argv
     )
-    session = start_session(
-        name,
-        command,
-        root=root,
+    options = dict(
         portal=args.portal,
         env_overrides=overrides,
         timeout=args.timeout,
@@ -3309,16 +4023,40 @@ def start_command(args) -> int:
         width=width,
         backend=args.backend,
         host_bus=args.host_bus,
+        renderer=args.renderer,
+        idle_timeout=idle_timeout,
+        max_lifetime=max_lifetime,
     )
+    # Held until the start has been reported, not only until the session is
+    # up: the `observe` below can take longer than a short idle timeout.
+    held = hold_session(name)
+    try:
+        return report_start(args, name, command, root, options)
+    finally:
+        if held is not None:
+            held.close()
+
+
+def report_start(args, name: str, command: str, root: Path, options: dict) -> int:
+    """Start the session `start` asked for and describe it."""
+    session = start_session(name, command, root=root, **options)
+    idle_timeout, max_lifetime = options["idle_timeout"], options["max_lifetime"]
     started = f"started {name} in {root}"
+    details = {
+        "renderer": session.renderer,
+        "idle_timeout": idle_timeout,
+        "max_lifetime": max_lifetime,
+    }
+    notes = [f"renderer: {session.renderer_note}"] if session.renderer_note else []
     if args.no_window_wait:
-        emit({"session": name, "root": str(root), "started": True}, started,
-             as_json=args.json)
+        emit({"session": name, "root": str(root), "started": True, **details},
+             "\n".join([started, *notes]), as_json=args.json)
         return 0
     # `observe` heals, waits and reports whether anything was drawn, so a
     # start needs nothing beyond it.
     payload = observe(session, window_match=None, do_heal=True, with_text=False)
     payload["root"] = str(root)
+    payload.update(details)
     if session.fit:
         payload["fit"] = session.fit
     # Healing a window that has only just mapped is routine, not news. How a
@@ -3327,8 +4065,10 @@ def start_command(args) -> int:
     lines = [started, describe_window(payload)]
     if session.fit and session.backend != "headless":
         lines.append(f"fit: {session.fit}")
+    lines += notes
     lines += describe_warnings(payload)
     emit(payload, "\n".join(lines), as_json=args.json)
+    touch_session(session)
     return 0
 
 
@@ -3340,6 +4080,7 @@ def list_command(args) -> int:
             "pid": s.pid,
             "alive": s.alive(),
             "backend": s.backend,
+            "renderer": s.renderer,
             "root": str(s.root),
         }
         for s in list_sessions()
@@ -3362,12 +4103,24 @@ def stop_command(args) -> int:
 
 def env_command(args) -> int:
     session = load_session(args.name or args.session)
-    variables = dict(session.env)
-    if session.bus:
-        variables["DBUS_SESSION_BUS_ADDRESS"] = session.bus
-    for key, value in variables.items():
-        print(f"export {key}={shell_quote(value)}")
-    return 0
+    # Held like any other command's, so the watchdog cannot stop the session
+    # between the check below and the exports being printed.
+    held = hold_session(session.name)
+    try:
+        if not session.alive():
+            raise HarnessError(dead_session_report([session]))
+        # Asking for the environment is how a session gets driven by other
+        # tools, so it counts as using the session.
+        touch_session(session)
+        variables = dict(session.env)
+        if session.bus:
+            variables["DBUS_SESSION_BUS_ADDRESS"] = session.bus
+        for key, value in variables.items():
+            print(f"export {key}={shell_quote(value)}")
+        return 0
+    finally:
+        if held is not None:
+            held.close()
 
 
 SESSION_COMMANDS = {

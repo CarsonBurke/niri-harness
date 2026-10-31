@@ -101,7 +101,12 @@ exit status and the end of its output. If it keeps running but never maps one,
 | `--portal {gtk,gnome,cosmic,kde}` | Make file-chooser portals open inside the session. Cannot be combined with `--host-bus`. |
 | `--env K=V` | Set an environment variable for the application. Repeatable. |
 | `--no-window-wait` | Return once the compositor is up, for commands that never open a window. |
-| `--timeout SECONDS` | How long to wait for the window (default 40). |
+| `--timeout SECONDS` | How long to wait for the window once the session's X server is up (default 40). |
+| `--renderer auto\|software\|NODE` | What the headless compositor draws with. `auto` (the default) uses a GPU when it can; see [Rendering](#rendering). |
+| `--idle-timeout DURATION` | Stop the session once no `niri-harness` command has used it for this long (default `1h`). `0` turns it off. |
+| `--max-lifetime DURATION` | Stop the session this long after it started, used or not (default `12h`). `0` turns it off. |
+
+Durations are written `90s`, `30m`, `2h` or `1h30m`; a bare number is seconds.
 
 `list` shows sessions and `stop [NAME]` tears one down. `env [NAME]` prints
 `export` lines for the session's `WAYLAND_DISPLAY`, `NIRI_SOCKET` and private
@@ -241,6 +246,60 @@ gaps and key repeat. Screenshots then show settled frames, the pointer cannot
 open the Overview by accident, and injected keystrokes are not read as held
 keys.
 
+## Rendering
+
+A headless session's compositor draws into `Xvfb`, which offers no GPU, so by
+itself it would composite on Mesa's software rasteriser. That is cheap for
+applications that also draw in software, and very expensive for ones that draw
+on a GPU, such as Chromium-based browsers or anything built on Vulkan or wgpu:
+their frames arrive in GPU memory, which the CPU reads slowly. One 1600x1000
+frame cost about three quarters of a CPU-second, so a page with a spinner kept
+the compositor at 500-1300% CPU while drawing 5-10 frames a second.
+
+With `--renderer auto`, the default, the compositor instead composites on a GPU
+through zink, Mesa's OpenGL on Vulkan. The same page then costs it about 6%
+CPU at 60 frames a second. `auto` picks the first GPU driven by a Mesa driver
+(amdgpu, i915, xe, nouveau and so on). It skips NVIDIA's own driver, which
+produced blank screenshots through zink in testing and could not take buffers
+from a client rendering on another GPU. If zink cannot start on the GPU it
+picked, the session renders in software and `start` says so, as it does when
+the only GPUs present are ones `auto` skips. With no GPU at all the session
+renders in software. A start that falls back stays within the one `--timeout`.
+
+`--renderer software` keeps the software path. `--renderer /dev/dri/renderD128`
+names a GPU outright; if zink cannot start on it, `start` fails instead of
+falling back. `--renderer` only affects headless sessions: under `--backend
+window` the host compositor's GPU is used. The renderer's settings are set
+for niri, so the helpers niri starts itself, such as `xwayland-satellite`,
+inherit them too. The application does not: it gets your environment back and
+picks its own GPU, as it would on a desktop. `list --json` reports what each
+session renders with.
+
+## Lifetime
+
+`start` leaves a small watchdog process behind with each session. It stops the
+session when either limit runs out:
+
+- `--idle-timeout` (default `1h`): no `niri-harness` command has used the
+  session for that long. `start` and every command that acts on the session
+  count, including `env` and `logs`; `list` and `stop` do not. A command that
+  is still running, such as a long `wait`, keeps the session in use, and a
+  command that arrives while the watchdog is stopping the session waits and
+  then reports why the session ended.
+- `--max-lifetime` (default `12h`): the session has run that long, whether it is
+  in use or not.
+
+A session stopped this way is shut down exactly as `stop` would do it. Its
+record stays, so the next command explains what happened instead of saying only
+that there is no session. `stop` then removes the record. The watchdog also
+reaps the session's X server if the compositor exits on its own, which nothing
+else would do. Starting a session again under the name of one that died
+cleans up whatever the dead one left running first.
+
+If you drive the application by some other route, such as a browser's DevTools
+protocol, the harness cannot see that use. Pass a longer `--idle-timeout`, or
+`--idle-timeout 0` and rely on `--max-lifetime`.
+
 ## Troubleshooting
 
 - **A dialog keeps losing focus.** `heal` focuses the main window before every
@@ -251,6 +310,12 @@ keys.
   Read the output it prints, or the whole of `ROOT/session.log`; the error
   names the file. If the app is single-instance, check that you did not pass
   `--host-bus`.
+- **The session ended by itself.** The next command says which limit ran out,
+  and `ROOT/ended` records it. Start again with a longer `--idle-timeout` or
+  `--max-lifetime`, or `0` for none.
+- **The compositor uses a lot of CPU.** Check `list --json`. A session that
+  shows `software` while running a GPU application composites its frames on the
+  CPU; `start` prints the reason it could not use a GPU.
 - **A control is missing from `observe`.** It may be disabled, off screen, or
   unreadable to OCR at the current size. Try `--observer ocr`, or a larger
   `--width`.
@@ -267,7 +332,9 @@ light-on-dark text. End-to-end tests start real nested sessions. They check
 that a terminal's output can be read back, that a bad command fails fast, that
 a session does not share your D-Bus session, that a headless session maps no
 host window, that a GTK app can be driven through its tree without reading any
-pixels, and that `stop` leaves no processes behind.
+pixels, that `stop` leaves no processes behind, that idle and over-age
+sessions stop themselves, and that an animated Vulkan client costs the
+compositor little CPU when a GPU is available.
 
 Tests whose dependencies are missing are skipped, with a message. The
 `--backend window` test also skips by default because it maps a window on your
@@ -286,7 +353,10 @@ tests/                self-test
 ```
 
 Session records live in `$XDG_RUNTIME_DIR/niri-harness`. Set
-`NIRI_HARNESS_STATE` to use a different directory. A session's root holds
+`NIRI_HARNESS_STATE` to use a different directory. Everything a session starts
+sees `NIRI_HARNESS_ROOT`, the session's root, which is how the harness finds
+those processes again to stop them. A session's root holds
 `session.log` (the application's output, which `logs` reads), `bus.log` (its
 private D-Bus daemon and the services that daemon starts),
-`compositor.log`, and `shots/`.
+`compositor.log`, `watchdog.log`, `ended` (why the watchdog stopped the
+session, if it did), and `shots/`.
