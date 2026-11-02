@@ -228,8 +228,25 @@ Each session gets:
 - **Its own accessibility bus**, when `at-spi2-core` is installed and
   `--host-bus` is not used.
 
-Screenshots use `grim`'s screencopy protocol rather than niri's screenshot
+Screenshots use the screencopy protocol rather than niri's screenshot
 action, so they never touch your clipboard or send notifications.
+
+For one output at the origin with `Normal` or `Flipped180` transform, the
+`vcap` client retains the complete physical-mode SHM buffer. This avoids
+grim's fractional-scale composite canvas, whose integer dimensions can omit
+the last physical row. The client requires wl_output v4, wlr-screencopy v3,
+little-endian XRGB8888, and a frame of at most 64 MiB. It refuses changed
+output identity/mode, unsupported flags, invalid stride or incomplete data.
+Buffer Y-inversion and output reflection are handled independently without
+resizing pixels. A selected raw capture never falls back after failure.
+Other transforms and multiple active outputs retain the existing grim path.
+
+`vcap` uses the existing Wayland client build dependencies and the vendored
+MIT wlr-screencopy protocol XML (wayland-protocols-wlr 0.3.12). Build it with
+`make`; a missing binary produces an explicit error instead of a partial
+frame. A full physical raster does not establish successful input delivery:
+the caller must still verify current geometry, containment and the intended
+target response.
 
 `stop` kills the session's whole process group, including the
 accessibility bus, which otherwise outlives the app. Before it signals
@@ -260,6 +277,9 @@ keys.
 ```console
 $ make check
 ```
+
+`python3 -I -B tests/raw_capture.py` runs only the offline capture regressions.
+It fakes the capture process/output IPC and never connects to a display.
 
 Unit tests cover label matching, merging the tree with OCR, per-window
 attribution, process-group cleanup, and OCR of both dark-on-light and
