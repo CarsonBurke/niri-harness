@@ -69,11 +69,47 @@ static uint32_t btn_of(const char *s) {
 // somewhere other than the requested point. Pinning to the origin with a
 // saturating relative move and then stepping out by logical pixels needs no
 // extents at all.
+//
+// The pin sweeps the pointer across the screen to its corner, so it must not
+// happen while a button is held: the application would see a drag through
+// everything on the way. Once this run has placed the pointer it knows where
+// it is, and a later absolute placement travels there directly.
+static int placed = 0;     // whether at_x, at_y hold the pointer's position
+static double at_x, at_y;  // logical pixels, valid while `placed`
+static int held = 0;       // buttons pressed by this run and not released
+
 static void pin_origin(void) {
   for (int i = 0; i < 8; i++) {
     zwlr_virtual_pointer_v1_motion(ptr, now_ms(), wl_fixed_from_double(-8192.0),
                                    wl_fixed_from_double(-8192.0));
     zwlr_virtual_pointer_v1_frame(ptr);
+  }
+  wl_display_flush(dpy);
+  placed = 1;
+  at_x = at_y = 0;
+}
+
+static void refuse_pin_while_held(const char *op) {
+  if (!held) return;
+  fprintf(stderr,
+          "%s: a button is held and this run has not placed the pointer, so "
+          "reaching an absolute point would drag through the screen's origin; "
+          "place it with `a` before pressing, in the same run\n",
+          op);
+  exit(2);
+}
+
+// Move by (dx, dy) in bounded increments, so no single motion is discarded as
+// a jump.
+static void travel(double dx, double dy) {
+  while (dx != 0 || dy != 0) {
+    double sx = dx > 256.0 ? 256.0 : dx < -256.0 ? -256.0 : dx;
+    double sy = dy > 256.0 ? 256.0 : dy < -256.0 ? -256.0 : dy;
+    zwlr_virtual_pointer_v1_motion(ptr, now_ms(), wl_fixed_from_double(sx),
+                                   wl_fixed_from_double(sy));
+    zwlr_virtual_pointer_v1_frame(ptr);
+    dx -= sx;
+    dy -= sy;
   }
   wl_display_flush(dpy);
 }
@@ -86,10 +122,20 @@ static void do_cmd(int argc, char **argv) {
                                             (uint32_t)atoi(argv[2]), out_w,
                                             out_h);
     zwlr_virtual_pointer_v1_frame(ptr);
+    // Physical extents: the logical position is not known on a scaled output.
+    placed = 0;
   } else if (!strcmp(op, "r") && argc >= 3) {
-    zwlr_virtual_pointer_v1_motion(ptr, now_ms(), wl_fixed_from_double(atof(argv[1])),
-                                   wl_fixed_from_double(atof(argv[2])));
+    double dx = atof(argv[1]), dy = atof(argv[2]);
+    zwlr_virtual_pointer_v1_motion(ptr, now_ms(), wl_fixed_from_double(dx),
+                                   wl_fixed_from_double(dy));
     zwlr_virtual_pointer_v1_frame(ptr);
+    if (placed) {
+      at_x += dx;
+      at_y += dy;
+      // The compositor stops the pointer at the screen's edge, which this
+      // run cannot see; a move past the origin is the edge it can.
+      if (at_x < 0 || at_y < 0) placed = 0;
+    }
   } else if (!strcmp(op, "c") && argc >= 2) {
     uint32_t b = btn_of(argv[1]);
     zwlr_virtual_pointer_v1_button(ptr, now_ms(), b, WL_POINTER_BUTTON_STATE_PRESSED);
@@ -102,9 +148,11 @@ static void do_cmd(int argc, char **argv) {
   } else if (!strcmp(op, "d") && argc >= 2) {
     zwlr_virtual_pointer_v1_button(ptr, now_ms(), btn_of(argv[1]), WL_POINTER_BUTTON_STATE_PRESSED);
     zwlr_virtual_pointer_v1_frame(ptr);
+    held++;
   } else if (!strcmp(op, "u") && argc >= 2) {
     zwlr_virtual_pointer_v1_button(ptr, now_ms(), btn_of(argv[1]), WL_POINTER_BUTTON_STATE_RELEASED);
     zwlr_virtual_pointer_v1_frame(ptr);
+    if (held) held--;
   } else if (!strcmp(op, "s") && argc >= 3) {
     // s v|h <notches>  (positive vertical = scroll down, positive horizontal = right)
     uint32_t axis = (argv[1][0] == 'h') ? WL_POINTER_AXIS_HORIZONTAL_SCROLL
@@ -129,24 +177,19 @@ static void do_cmd(int argc, char **argv) {
                           (long)(atoi(argv[1]) % 1000) * 1000000L};
     nanosleep(&ts, NULL);
   } else if (!strcmp(op, "home") && argc >= 1) {
+    refuse_pin_while_held("home");
     pin_origin();
   } else if (!strcmp(op, "a") && argc >= 3) {
-    // Absolute placement in logical pixels, via the origin.
-    pin_origin();
+    // Absolute placement in logical pixels: from where this run last placed
+    // the pointer, or else via the origin.
     double x = atof(argv[1]), y = atof(argv[2]);
-    // Step in bounded increments so no single motion is discarded as a jump.
-    double done_x = 0, done_y = 0;
-    while (done_x < x || done_y < y) {
-      double dx = x - done_x, dy = y - done_y;
-      if (dx > 256.0) dx = 256.0;
-      if (dy > 256.0) dy = 256.0;
-      zwlr_virtual_pointer_v1_motion(ptr, now_ms(), wl_fixed_from_double(dx),
-                                     wl_fixed_from_double(dy));
-      zwlr_virtual_pointer_v1_frame(ptr);
-      done_x += dx;
-      done_y += dy;
+    if (!placed) {
+      refuse_pin_while_held("a");
+      pin_origin();
     }
-    wl_display_flush(dpy);
+    travel(x - at_x, y - at_y);
+    at_x = x;
+    at_y = y;
   } else {
     fprintf(stderr, "bad command: %s\n", op);
     exit(2);
