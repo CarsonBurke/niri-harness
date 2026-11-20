@@ -1277,6 +1277,80 @@ def declared(text, x, y, width=40, height=12, role="push button", enabled=True):
                      confidence=100.0, role=role, enabled=enabled)
 
 
+MOUSE_LOGGER = r"""
+import os, re, sys, termios, tty
+log = open(sys.argv[1], "w", buffering=1)
+tty.setraw(sys.stdin.fileno())
+# Report every motion, with or without a button, in SGR form.
+sys.stdout.write("\x1b[?1003h\x1b[?1006h")
+sys.stdout.flush()
+log.write("ready\n")
+pending = b""
+while True:
+    pending += os.read(sys.stdin.fileno(), 4096)
+    while (m := re.search(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])", pending)):
+        b, x, y, kind = m.groups()
+        log.write(f"{int(b)} {int(x)} {int(y)} {kind.decode()}\n")
+        pending = pending[m.end():]
+"""
+
+
+def test_a_held_button_never_travels_through_the_origin() -> None:
+    """An absolute placement while a button is held goes straight there.
+
+    `a` reaches a point by pinning the pointer to the origin, which with a
+    button down would drag through the corner of the screen. Once a run has
+    placed the pointer, a later `a` in it travels directly; a run that has not
+    refuses rather than sweep.
+    """
+    require("niri")
+    require("kitty")
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        raise _Skip("no host Wayland session")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        script = Path(scratch) / "mouse.py"
+        script.write_text(MOUSE_LOGGER)
+        log = Path(scratch) / "mouse.log"
+        session = H.start_session(
+            "niri-harness-selftest-held",
+            f"exec kitty -- python3 {script} {log}",
+            root=Path(scratch) / "run",
+            portal=None,
+            env_overrides={},
+            timeout=60.0,
+        )
+        try:
+            deadline = time.monotonic() + 20
+            while not (log.exists() and log.read_text().startswith("ready")):
+                if time.monotonic() > deadline:
+                    raise AssertionError("the mouse logger never started")
+                time.sleep(0.1)
+            H.pointer(session, "a", "300", "300", ";", "w", "200", ";", "d", "left",
+                      ";", "w", "200", ";", "a", "500", "400", ";", "w", "200",
+                      ";", "u", "left", ";", "w", "200")
+            time.sleep(0.5)
+            events = [line.split() for line in log.read_text().splitlines()[1:]]
+            presses = [(int(x), int(y)) for b, x, y, kind in events if b == "0" and kind == "M"]
+            # Left-button motion is reported as button 0 plus the motion bit.
+            held = [(int(x), int(y)) for b, x, y, kind in events if b == "32"]
+            check("the press is reported", len(presses) == 1, str(events))
+            if presses:
+                (px, py) = presses[0]
+                check("the held pointer moves", bool(held) and held[-1] > (px, py), str(held))
+                check("nothing held is reported short of where it was pressed",
+                      all(x >= px and y >= py for x, y in held), f"press {presses[0]}: {held}")
+
+            refused = H.run([str(H.VPTR), "d", "left", ";", "a", "100", "100"],
+                            env=session.env, check=False)
+            H.pointer(session, "u", "left")
+            check("a run that has not placed the pointer refuses to pin it while held",
+                  refused.returncode == 2 and b"button is held" in refused.stderr,
+                  f"{refused.returncode}: {refused.stderr!r}")
+        finally:
+            H.stop_session(session)
+
+
 def test_a_tree_that_answers_partly_does_not_hide_the_rest_of_the_screen() -> None:
     """A toolkit publishes controls it has no name for, and they are dropped.
 
@@ -1814,6 +1888,7 @@ def main() -> int:
         test_a_headless_session_maps_nothing_and_is_sized_exactly,
         test_a_declared_control_is_found_without_reading_the_screen,
         test_a_drag_travels_between_its_ends_without_passing_the_origin,
+        test_a_held_button_never_travels_through_the_origin,
         test_a_tree_that_answers_partly_does_not_hide_the_rest_of_the_screen,
         test_a_menu_named_after_its_button_does_not_hide_its_own_items,
         test_heal_claims_no_repair_it_did_not_make,
